@@ -1,5 +1,6 @@
 import sys
 import time
+import argparse
 
 import redis
 
@@ -21,17 +22,10 @@ from state import State
 from strokes import load_strokes
 
 
-def main():
-    # Optional command line:
-    #   python draw_strokes_position_only.py strokes_canvas_plane.json
-    if len(sys.argv) >= 2:
-        json_path = sys.argv[1]
-    else:
-        json_path = DEFAULT_JSON_PATH
-
+def draw_strokes(json_path=DEFAULT_JSON_PATH, hold_done=True, canvas_offset_vec=None):
     print("Loading stroke JSON:", json_path)
 
-    strokes, metadata = load_strokes(json_path)
+    strokes, metadata = load_strokes(json_path, offset_vec=canvas_offset_vec)
 
     print("Loaded strokes:", len(strokes))
     if "num_strokes" in metadata:
@@ -48,14 +42,14 @@ def main():
     if config_raw is None:
         print("Could not read config file name from Redis.")
         print("Missing key:", redis_keys.config_file_name)
-        return
+        return False
 
     config_file_name = decode_redis_value(config_raw)
 
     if config_file_name != config_file_for_this_example:
         print("This script is meant to be used with config file:", config_file_for_this_example)
         print("Current config file:", config_file_name)
-        return
+        return False
 
     # Set active controller.
     while redis_client.get(redis_keys.active_controller).decode("utf-8") != controller_to_use:
@@ -74,6 +68,8 @@ def main():
     print("Current position:", current_position)
     print("INIT_POS:", INIT_POS)
     print("RETRACT_VEC:", RETRACT_VEC)
+    if canvas_offset_vec is not None:
+        print("Canvas stroke offset vector (m):", canvas_offset_vec)
 
     # Build the drawing path after INIT. Startup travel to INIT is a single goal
     # so the Cartesian controller can handle the motion internally.
@@ -83,7 +79,7 @@ def main():
 
     if len(path) == 0:
         print("Path is empty. Exiting.")
-        return
+        return False
 
     # Send INIT once, then keep holding it until the controller reaches it.
     path_index = 0
@@ -153,6 +149,8 @@ def main():
                         send_position(redis_client, INIT_POS)
                         state = State.DONE
                         print("Finished all strokes. Holding INIT.")
+                        if not hold_done:
+                            return True
                     else:
                         send_position(redis_client, path[path_index])
 
@@ -163,10 +161,35 @@ def main():
 
     except KeyboardInterrupt:
         print("Keyboard interrupt. Exiting.")
+        return False
 
     except Exception as e:
         print("Exception occurred:")
         print(e)
+        return False
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Draw mapped canvas stroke JSON with the robot.")
+    parser.add_argument(
+        "json_path",
+        nargs="?",
+        default=DEFAULT_JSON_PATH,
+        help=f"Mapped canvas stroke JSON (default: {DEFAULT_JSON_PATH}).",
+    )
+    parser.add_argument(
+        "--return-when-done",
+        action="store_true",
+        help="Exit after finishing all strokes instead of holding INIT forever.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ok = draw_strokes(args.json_path, hold_done=not args.return_when_done)
+    if ok is False:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

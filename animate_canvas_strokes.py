@@ -1,8 +1,12 @@
 import os
 import json
 import math
+import argparse
 
 import numpy as np
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/cs225a-picasso-matplotlib")
+
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -437,5 +441,24 @@ def create_simulation(input_json=INPUT_JSON, out_dir=OUT_DIR):
     }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Create a 3D canvas-plane stroke simulation from mapped stroke JSON."
+    )
+    parser.add_argument(
+        "input_json",
+        nargs="?",
+        default=INPUT_JSON,
+        help=f"Mapped canvas stroke JSON (default: {INPUT_JSON}).",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=OUT_DIR,
+        help=f"Output directory (default: {OUT_DIR}).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    create_simulation()
+    args = parse_args()
+    create_simulation(input_json=args.input_json, out_dir=args.out_dir)

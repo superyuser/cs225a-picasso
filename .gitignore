@@ -2,3 +2,23 @@
 .venv/
 __pycache__/
 *.py[cod]
+
+# Generated CV and robot workflow outputs
+computer-vision/captures/
+computer-vision/art-renders/
+computer-vision/stroke-renders/
+computer-vision/stroke-jsons/
+computer-vision/metadata.json
+computer-vision/.phone-camera-cert.pem
+computer-vision/.phone-camera-key.pem
+robot/mapped-strokes/
+robot/canvas-simulations/
+robot/cv_robot_metadata.json
+
+# Generated animation/media artifacts
+canvas_plane_simulation/
+*.gif
+*.mp4
+*.avi
+*.mov
+*.mkv

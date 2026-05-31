@@ -28,7 +28,7 @@ def extract_stroke_points(stroke):
     return pts[:, :3]
 
 
-def load_strokes(json_path):
+def load_strokes(json_path, offset_vec=None):
     """
     Load strokes from strokes_canvas_plane.json.
 
@@ -57,10 +57,14 @@ def load_strokes(json_path):
         key=lambda s: s.get("order", 0)
     )
 
+    offset = np.zeros(3, dtype=float) if offset_vec is None else np.array(offset_vec, dtype=float)
+    if offset.shape != (3,):
+        raise ValueError(f"offset_vec must have shape (3,), got {offset.shape}")
+
     parsed_strokes = []
 
     for stroke in strokes_raw:
-        pts = extract_stroke_points(stroke)
+        pts = extract_stroke_points(stroke) + offset
 
         if pts.shape[0] < 1:
             continue

@@ -13,5 +13,23 @@
     "strokes_json": "stroke-jsons/phone_20260531T162156.json",
     "stroke_renders_dir": "stroke-renders/phone_20260531T162156",
     "strokes_at": "2026-05-31T16:22:23"
+  },
+  {
+    "id": "phone_20260531T162737",
+    "capture": "captures/phone_20260531T162737.jpg",
+    "render": "art-renders/phone_20260531T162737.png",
+    "rendered_at": "2026-05-31T16:27:51"
+  },
+  {
+    "id": "phone_20260531T163810",
+    "capture": "captures/phone_20260531T163810.jpg",
+    "render": "art-renders/phone_20260531T163810.png",
+    "rendered_at": "2026-05-31T16:38:31"
+  },
+  {
+    "id": "phone_20260531T164940",
+    "capture": "captures/phone_20260531T164940.jpg",
+    "render": "art-renders/phone_20260531T164940.png",
+    "rendered_at": "2026-05-31T16:50:01"
   }
 ]

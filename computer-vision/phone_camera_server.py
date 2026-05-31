@@ -277,12 +277,17 @@ def _decode_jpeg(body: bytes):
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-def _largest_face(detector: cv2.CascadeClassifier, image, min_size: tuple[int, int]):
+def _largest_face(
+    detector: cv2.CascadeClassifier,
+    image,
+    min_size: tuple[int, int],
+    min_neighbors: int = 3,
+):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     faces = detector.detectMultiScale(
         gray,
         scaleFactor=1.1,
-        minNeighbors=5,
+        minNeighbors=min_neighbors,
         minSize=min_size,
     )
     if len(faces) == 0:
@@ -297,19 +302,19 @@ def _validated_capture_jpeg(body: bytes) -> tuple[bytes, dict]:
 
     detector = _load_face_detector()
     min_frame_side = min(frame.shape[:2])
-    min_face_side = max(80, int(min_frame_side * 0.08))
+    min_face_side = max(50, int(min_frame_side * 0.06))
     face = _largest_face(detector, frame, (min_face_side, min_face_side))
     if face is None:
         raise ValueError("no clear human face detected")
+
+    _, _, face_w, face_h = face
+    if min(face_w, face_h) < min_face_side:
+        raise ValueError("detected face is too small")
 
     x1, y1, x2, y2 = _make_square_face_shoulder_bbox(face, frame.shape)
     crop = frame[y1:y2, x1:x2].copy()
     if crop.size == 0:
         raise ValueError("face crop was empty")
-
-    min_crop_face_side = max(50, int(min(crop.shape[:2]) * 0.16))
-    if _largest_face(detector, crop, (min_crop_face_side, min_crop_face_side)) is None:
-        raise ValueError("face is not clear enough in the crop")
 
     ok, encoded = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
     if not ok:

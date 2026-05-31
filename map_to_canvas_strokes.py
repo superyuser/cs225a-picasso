@@ -1,6 +1,8 @@
 import json
 import os
+import argparse
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +15,8 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 INPUT_STROKES_JSON = SCRIPT_DIR / "computer-vision" / "stroke-jsons" / "phone_20260531T160010.json"
-OUTPUT_STROKES_JSON = SCRIPT_DIR / "computer-vision" / "stroke-jsons" / "strokes_canvas_plane2.json"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "robot" / "mapped-strokes"
+OUTPUT_STROKES_JSON = DEFAULT_OUTPUT_DIR / "phone_20260531T160010.canvas.json"
 CALIBRATION_JSON = SCRIPT_DIR / "robot" / "canvas_calibration.json"
 
 
@@ -304,6 +307,16 @@ def arr_to_list(a):
     return [float(x) for x in np.asarray(a).reshape(-1)]
 
 
+def default_canvas_output_path(
+    input_json_path,
+    output_dir=DEFAULT_OUTPUT_DIR,
+    now: datetime | None = None,
+):
+    input_path = Path(input_json_path)
+    timestamp = (now or datetime.now()).strftime("%Y%m%dT%H%M%S%f")
+    return Path(output_dir) / f"{input_path.stem}.canvas.{timestamp}.json"
+
+
 def load_canvas_calibration(calibration_json_path=CALIBRATION_JSON):
     with open(calibration_json_path, "r") as f:
         calibration = json.load(f)
@@ -346,9 +359,17 @@ def load_canvas_calibration(calibration_json_path=CALIBRATION_JSON):
 
 def convert_strokes_to_canvas_plane(
     input_json_path=INPUT_STROKES_JSON,
-    output_json_path=OUTPUT_STROKES_JSON,
+    output_json_path=None,
     calibration_json_path=CALIBRATION_JSON,
 ):
+    input_json_path = Path(input_json_path)
+    output_json_path = (
+        Path(output_json_path)
+        if output_json_path is not None
+        else default_canvas_output_path(input_json_path)
+    )
+    calibration_json_path = Path(calibration_json_path)
+
     with open(input_json_path, "r") as f:
         payload = json.load(f)
 
@@ -510,5 +531,45 @@ def convert_strokes_to_canvas_plane(
     return output
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Map CV stroke JSON pixel coordinates onto the calibrated robot canvas."
+    )
+    parser.add_argument(
+        "input_json",
+        nargs="?",
+        default=str(INPUT_STROKES_JSON),
+        help=f"Input CV stroke JSON (default: {INPUT_STROKES_JSON}).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-json",
+        default=None,
+        help=(
+            "Output canvas-plane JSON. Defaults to "
+            "robot/mapped-strokes/<input-stem>.canvas.<timestamp>.json."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help=f"Directory used when --output-json is omitted (default: {DEFAULT_OUTPUT_DIR}).",
+    )
+    parser.add_argument(
+        "--calibration-json",
+        default=str(CALIBRATION_JSON),
+        help=f"Canvas calibration JSON (default: {CALIBRATION_JSON}).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    convert_strokes_to_canvas_plane()
+    args = parse_args()
+    output_json = args.output_json
+    if output_json is None:
+        output_json = default_canvas_output_path(args.input_json, args.output_dir)
+    convert_strokes_to_canvas_plane(
+        input_json_path=args.input_json,
+        output_json_path=output_json,
+        calibration_json_path=args.calibration_json,
+    )
