@@ -34,7 +34,7 @@ DRAW_STEP_M = 0.003     # drawing motion on paper
 #
 # Units are meters.
 # -0.1 = -10 cm in world x.
-RETRACT_X_M = -0.2
+RETRACT_X_M = -0.08
 RETRACT_VEC = np.array([RETRACT_X_M, 0.0, 0.0], dtype=float)
 
 # INIT position from calibration.

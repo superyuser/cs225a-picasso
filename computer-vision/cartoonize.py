@@ -21,8 +21,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-from openai import OpenAI
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 
 def _log(msg: str) -> None:
@@ -58,13 +60,22 @@ def get_prompt(key: str = DEFAULT_PROMPT_KEY) -> str:
 
 
 @lru_cache(maxsize=1)
-def _get_client() -> OpenAI:
-    load_dotenv()
+def _get_client():
+    if load_dotenv is not None:
+        load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. Add it to your environment or a .env file."
+            "OPENAI_API_KEY is not set. Export it in your environment"
+            " or install python-dotenv to load it from a .env file."
         )
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "The openai package is not installed. Install computer-vision "
+            "dependencies with `python3 -m pip install openai python-dotenv`."
+        ) from exc
     _log("OpenAI client initialized")
     return OpenAI(api_key=api_key)
 

@@ -1,0 +1,17 @@
+[
+  {
+    "id": "phone_20260531T160010",
+    "capture": "captures/phone_20260531T160010.jpg",
+    "render": "art-renders/phone_20260531T160010.png",
+    "rendered_at": "2026-05-31T16:00:28"
+  },
+  {
+    "id": "phone_20260531T162156",
+    "capture": "captures/phone_20260531T162156.jpg",
+    "render": "art-renders/phone_20260531T162156.png",
+    "rendered_at": "2026-05-31T16:22:12",
+    "strokes_json": "stroke-jsons/phone_20260531T162156.json",
+    "stroke_renders_dir": "stroke-renders/phone_20260531T162156",
+    "strokes_at": "2026-05-31T16:22:23"
+  }
+]

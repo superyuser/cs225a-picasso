@@ -10,9 +10,11 @@ import numpy as np
 # INPUT / OUTPUT
 # ============================================================
 
-INPUT_STROKES_JSON = "strokes.json"
-OUTPUT_STROKES_JSON = "strokes_canvas_plane.json"
-CALIBRATION_JSON = Path("robot") / "canvas_calibration.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+INPUT_STROKES_JSON = SCRIPT_DIR / "computer-vision" / "stroke-jsons" / "phone_20260531T160010.json"
+OUTPUT_STROKES_JSON = SCRIPT_DIR / "computer-vision" / "stroke-jsons" / "strokes_canvas_plane2.json"
+CALIBRATION_JSON = SCRIPT_DIR / "robot" / "canvas_calibration.json"
 
 
 # ============================================================
@@ -383,7 +385,7 @@ def convert_strokes_to_canvas_plane(
     }
 
     output["canvas_mapping"] = {
-        "input_strokes_json": input_json_path,
+        "input_strokes_json": str(input_json_path),
         "padding_m": float(CANVAS_PADDING_M),
         "preserve_aspect_ratio": bool(PRESERVE_ASPECT_RATIO),
         "flip_y": bool(FLIP_Y),

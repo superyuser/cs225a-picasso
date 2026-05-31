@@ -1,0 +1,8 @@
+openai
+python-dotenv
+opencv-python
+numpy
+Pillow
+matplotlib
+scikit-image
+tqdm
