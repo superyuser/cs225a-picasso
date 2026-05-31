@@ -75,7 +75,8 @@ def main():
     print("INIT_POS:", INIT_POS)
     print("RETRACT_VEC:", RETRACT_VEC)
 
-    # Build the entire drawing path.
+    # Build the drawing path after INIT. Startup travel to INIT is a single goal
+    # so the Cartesian controller can handle the motion internally.
     path, labels = build_drawing_path(current_position, strokes)
 
     print("Total commanded waypoints:", len(path))
@@ -84,14 +85,14 @@ def main():
         print("Path is empty. Exiting.")
         return
 
-    # Send first goal.
+    # Send INIT once, then keep holding it until the controller reaches it.
     path_index = 0
-    send_position(redis_client, path[path_index])
+    send_position(redis_client, INIT_POS)
 
-    state = State.EXECUTING_PATH
+    state = State.GOING_INIT
 
     print("Starting position-only stroke drawing.")
-    print("First label:", labels[path_index])
+    print("Going directly to INIT position.")
 
     loop_time = 0.0
     time.sleep(0.01)
@@ -108,7 +109,24 @@ def main():
                 (3,)
             )
 
-            if state == State.EXECUTING_PATH:
+            if state == State.GOING_INIT:
+                err = position_error(current_position, INIT_POS)
+
+                print(
+                    "GOING_INIT",
+                    "| pos_error:", round(err, 5)
+                )
+
+                send_position(redis_client, INIT_POS)
+
+                if err < POS_TOL_M:
+                    time.sleep(DWELL_AT_INIT_S)
+                    send_position(redis_client, path[path_index])
+                    state = State.EXECUTING_PATH
+                    print("Reached INIT position.")
+                    print("First label:", labels[path_index])
+
+            elif state == State.EXECUTING_PATH:
                 target = path[path_index]
                 err = position_error(current_position, target)
 
@@ -128,8 +146,6 @@ def main():
                         time.sleep(DWELL_BEFORE_CONTACT_S)
                     elif label.endswith("_retract"):
                         time.sleep(DWELL_AFTER_RETRACT_S)
-                    elif label == "travel_to_INIT":
-                        time.sleep(DWELL_AT_INIT_S)
 
                     path_index += 1
 

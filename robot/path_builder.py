@@ -1,5 +1,3 @@
-import numpy as np
-
 from config import DRAW_STEP_M, INIT_POS, RETRACT_VEC, TRAVEL_STEP_M
 from interpolation import make_position_segment
 
@@ -20,12 +18,12 @@ def append_segment(path, labels, p0, p1, step_m, label):
         labels.append(label)
 
 
-def build_drawing_path(current_pos, strokes):
+def build_drawing_path(_current_pos, strokes):
     """
     Build one flattened position-only path.
 
     Motion plan:
-      current_pos -> INIT_POS
+      start at INIT_POS
       for each stroke:
         travel to stroke_start + RETRACT_VEC
         move forward to stroke_start
@@ -36,17 +34,6 @@ def build_drawing_path(current_pos, strokes):
     path = []
     labels = []
 
-    p_cursor = np.array(current_pos, dtype=float)
-
-    # 1. Go to INIT.
-    append_segment(
-        path,
-        labels,
-        p_cursor,
-        INIT_POS,
-        step_m=TRAVEL_STEP_M,
-        label="travel_to_INIT"
-    )
     p_cursor = INIT_POS.copy()
 
     # 2. Stroke execution.
