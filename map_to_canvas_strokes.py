@@ -1,7 +1,7 @@
 import json
-import math
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 
@@ -12,17 +12,18 @@ import numpy as np
 
 INPUT_STROKES_JSON = "strokes.json"
 OUTPUT_STROKES_JSON = "strokes_canvas_plane.json"
+CALIBRATION_JSON = Path("robot") / "canvas_calibration.json"
 
 
 # ============================================================
-# PLACEHOLDER CALIBRATED CANVAS CORNERS
+# CALIBRATED CANVAS CORNERS
 # Units: meters
 # ============================================================
 
-TL_RAW = np.array([0.76339, 0.23599, 0.52382], dtype=float)
-TR_RAW = np.array([0.77134, 0.01594, 0.52738], dtype=float)
-BL_RAW = np.array([0.68800, 0.24318, 0.31856], dtype=float)
-BR_RAW = np.array([0.69681, 0.01935, 0.32363], dtype=float)
+# Optional offset applied to all mapped stroke points after the canvas frame is
+# computed from calibration points. Negative world x pulls contact points back
+# from the page for this robot setup; positive x pushes them into the page.
+DEFAULT_STROKE_PLANE_OFFSET_XYZ_M = np.array([0.0, 0.0, 0.0], dtype=float)
 
 
 # ============================================================
@@ -301,6 +302,42 @@ def arr_to_list(a):
     return [float(x) for x in np.asarray(a).reshape(-1)]
 
 
+def load_canvas_calibration(calibration_json_path=CALIBRATION_JSON):
+    with open(calibration_json_path, "r") as f:
+        calibration = json.load(f)
+
+    corners = calibration.get("raw_corners_xyz")
+    if not isinstance(corners, dict):
+        raise ValueError(f"{calibration_json_path} missing raw_corners_xyz object.")
+
+    required = ("TL", "TR", "BL", "BR")
+    missing = [name for name in required if name not in corners]
+    if missing:
+        raise ValueError(
+            f"{calibration_json_path} missing raw corner(s): {', '.join(missing)}"
+        )
+
+    raw_corners = {}
+    for name in required:
+        point = np.asarray(corners[name], dtype=float)
+        if point.shape != (3,):
+            raise ValueError(
+                f"{calibration_json_path} raw_corners_xyz.{name} must be [x, y, z]."
+            )
+        raw_corners[name] = point
+
+    offset = np.asarray(
+        calibration.get("stroke_plane_offset_xyz_m", DEFAULT_STROKE_PLANE_OFFSET_XYZ_M),
+        dtype=float,
+    )
+    if offset.shape != (3,):
+        raise ValueError(
+            f"{calibration_json_path} stroke_plane_offset_xyz_m must be [x, y, z]."
+        )
+
+    return raw_corners, offset
+
+
 # ============================================================
 # MAIN CONVERSION
 # ============================================================
@@ -308,11 +345,20 @@ def arr_to_list(a):
 def convert_strokes_to_canvas_plane(
     input_json_path=INPUT_STROKES_JSON,
     output_json_path=OUTPUT_STROKES_JSON,
+    calibration_json_path=CALIBRATION_JSON,
 ):
     with open(input_json_path, "r") as f:
         payload = json.load(f)
 
-    frame = compute_clean_canvas_frame(TL_RAW, TR_RAW, BL_RAW, BR_RAW)
+    raw_corners, stroke_plane_offset = load_canvas_calibration(
+        calibration_json_path
+    )
+    frame = compute_clean_canvas_frame(
+        raw_corners["TL"],
+        raw_corners["TR"],
+        raw_corners["BL"],
+        raw_corners["BR"],
+    )
 
     all_px = collect_all_pixel_points(payload)
     pixel_bbox = compute_pixel_bbox(all_px)
@@ -342,12 +388,14 @@ def convert_strokes_to_canvas_plane(
         "preserve_aspect_ratio": bool(PRESERVE_ASPECT_RATIO),
         "flip_y": bool(FLIP_Y),
         "drawing_scale": float(DRAWING_SCALE),
+        "calibration_json": str(calibration_json_path),
+        "stroke_plane_offset_xyz_m": arr_to_list(stroke_plane_offset),
 
         "raw_corners_xyz": {
-            "TL": arr_to_list(TL_RAW),
-            "TR": arr_to_list(TR_RAW),
-            "BL": arr_to_list(BL_RAW),
-            "BR": arr_to_list(BR_RAW),
+            "TL": arr_to_list(raw_corners["TL"]),
+            "TR": arr_to_list(raw_corners["TR"]),
+            "BL": arr_to_list(raw_corners["BL"]),
+            "BR": arr_to_list(raw_corners["BR"]),
         },
 
         "clean_corners_xyz": {
@@ -389,7 +437,7 @@ def convert_strokes_to_canvas_plane(
             px, py = float(p[0]), float(p[1])
 
             u, v = pixel_to_local_uv(px, py, pixel_bbox, fit)
-            xyz = local_uv_to_xyz(u, v, frame)
+            xyz = local_uv_to_xyz(u, v, frame) + stroke_plane_offset
 
             if INCLUDE_LOCAL_UV_METERS:
                 points_uv.append([float(u), float(v)])
@@ -425,6 +473,7 @@ def convert_strokes_to_canvas_plane(
     print("===================================================")
     print(f"Input:  {input_json_path}")
     print(f"Output: {output_json_path}")
+    print(f"Calibration: {calibration_json_path}")
     print()
     print("Raw measured canvas:")
     print(f"  top width:     {frame['measured']['top_width_m']:.4f} m")
@@ -442,6 +491,7 @@ def convert_strokes_to_canvas_plane(
     print(f"  u_axis:        {arr_to_list(frame['u_axis'])}")
     print(f"  v_axis:        {arr_to_list(frame['v_axis'])}")
     print(f"  normal:        {arr_to_list(frame['normal'])}")
+    print(f"  stroke offset: {arr_to_list(stroke_plane_offset)}")
     print()
     print("Stroke pixel bbox fitted:")
     print(f"  x:             {pixel_bbox['x_min']:.2f} -> {pixel_bbox['x_max']:.2f}")

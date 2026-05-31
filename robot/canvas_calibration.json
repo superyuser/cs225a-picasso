@@ -1,0 +1,11 @@
+{
+  "units": "meters",
+  "description": "Raw canvas corner calibration points in robot/world XYZ coordinates.",
+  "raw_corners_xyz": {
+    "TL": [0.78703, 0.19471, 0.52166],
+    "TR": [0.79457, -0.07435, 0.52228],
+    "BL": [0.68811, 0.19235, 0.26834],
+    "BR": [0.69649, -0.07213, 0.27021]
+  },
+  "stroke_plane_offset_xyz_m": [-0.018, 0.0, 0.0]
+}
