@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -16,9 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ROBOT_DIR = Path(__file__).resolve().parent
 CV_STROKE_JSONS_DIR = REPO_ROOT / "computer-vision" / "stroke-jsons"
 MAPPED_STROKES_DIR = ROBOT_DIR / "mapped-strokes"
-CANVAS_SIMULATIONS_DIR = ROBOT_DIR / "canvas-simulations"
 METADATA_PATH = ROBOT_DIR / "cv_robot_metadata.json"
-IMAGE_POPUP = REPO_ROOT / "image_popup.py"
 POLL_INTERVAL_SECONDS = 0.5
 CANVAS_X_OFFSET_M = 0.03
 CANVAS_OFFSET_VEC = [CANVAS_X_OFFSET_M, 0.0, 0.0]
@@ -29,7 +26,6 @@ if str(ROBOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROBOT_DIR))
 
 from map_to_canvas_strokes import convert_strokes_to_canvas_plane, default_canvas_output_path
-from animate_canvas_strokes import create_simulation
 from main import draw_strokes
 
 
@@ -115,19 +111,6 @@ def is_cv_stroke_json(path: Path) -> bool:
     return isinstance(payload.get("strokes"), list) and "canvas_mapping" not in payload
 
 
-def launch_image_popup(image_path: Path, title: str) -> None:
-    subprocess.Popen(
-        [
-            sys.executable,
-            str(IMAGE_POPUP),
-            str(image_path),
-            "--title",
-            title,
-        ],
-        cwd=REPO_ROOT,
-    )
-
-
 def map_and_draw(source_path: Path, *, run_robot: bool = True) -> Path:
     MAPPED_STROKES_DIR.mkdir(parents=True, exist_ok=True)
     mapped_path = default_canvas_output_path(source_path, MAPPED_STROKES_DIR)
@@ -165,22 +148,6 @@ def map_and_draw(source_path: Path, *, run_robot: bool = True) -> Path:
             "mapped_strokes_json": relative(mapped_path),
             "mapping_status": "complete",
             "mapping_completed_at": iso_now(),
-        },
-    )
-
-    simulation_dir = CANVAS_SIMULATIONS_DIR / source_path.stem
-    print(f"[{source_path.stem}] building canvas animation preview")
-    simulation = create_simulation(input_json=mapped_path, out_dir=simulation_dir)
-    static_preview_path = Path(simulation["static_path"])
-    launch_image_popup(
-        static_preview_path,
-        f"{source_path.stem} canvas world final",
-    )
-    upsert_metadata(
-        source_path,
-        {
-            "canvas_simulation_static": relative(static_preview_path),
-            "canvas_simulation_dir": relative(simulation_dir),
         },
     )
 
@@ -234,15 +201,15 @@ def watch_directory(
     directory: Path,
     on_stable_file: Callable[[Path], None],
     *,
-    process_existing: bool = False,
     poll_interval: float = POLL_INTERVAL_SECONDS,
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     pending_sizes: dict[Path, int] = {}
-    seen = set() if process_existing else {relative(path) for path in directory.glob("*.json")}
+    seen = {relative(path) for path in directory.glob("*.json")}
     seen.update(processed_sources())
 
     print(f"Watching {relative(directory)} for CV stroke JSONs.")
+    print("Ignoring JSONs that existed before this watcher started.")
     print(f"Mapped outputs: {relative(MAPPED_STROKES_DIR)}")
     print(f"Metadata: {relative(METADATA_PATH)}")
 
@@ -278,11 +245,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Directory to watch (default: {CV_STROKE_JSONS_DIR}).",
     )
     parser.add_argument(
-        "--process-existing",
-        action="store_true",
-        help="Process existing uncompleted JSONs instead of only future files.",
-    )
-    parser.add_argument(
         "--no-robot",
         action="store_true",
         help="Only map files and update metadata; do not call robot/main.py.",
@@ -307,7 +269,6 @@ def main() -> None:
         watch_directory(
             source_dir,
             handle_file,
-            process_existing=args.process_existing,
             poll_interval=args.poll_interval,
         )
     except KeyboardInterrupt:
