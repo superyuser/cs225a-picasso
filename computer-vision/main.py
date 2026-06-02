@@ -63,19 +63,19 @@ def _relative(path: Path) -> str:
         return str(path.as_posix())
 
 
-def _processed_capture_keys(entries: list[dict]) -> set[str]:
-    return {entry["capture"] for entry in entries if "capture" in entry}
+def _existing_image_keys(target_dir: Path) -> set[str]:
+    """Snapshot keys of every image already present in ``target_dir``.
 
-
-def _processed_render_keys() -> set[str]:
-    """Renders that already have a matching ``stroke-jsons/<stem>.json``."""
-    if not STROKE_JSONS_DIR.exists():
+    Files in this snapshot are treated as 'already seen' so we never backfill
+    old captures/renders on startup. Only files added *after* main() starts
+    will trigger processing.
+    """
+    if not target_dir.exists():
         return set()
-    processed_stems = {f.stem for f in STROKE_JSONS_DIR.glob("*.json")}
     keys: set[str] = set()
-    for stem in processed_stems:
-        for ext in IMAGE_EXTENSIONS:
-            keys.add(_relative(RENDERS_DIR / f"{stem}{ext}"))
+    for path in target_dir.iterdir():
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            keys.add(_relative(path))
     return keys
 
 
@@ -190,6 +190,8 @@ def watch_directory(
 
 
 def main() -> None:
+    script_start = time.perf_counter()
+
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
     RENDERS_DIR.mkdir(parents=True, exist_ok=True)
     STROKE_JSONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -198,8 +200,12 @@ def main() -> None:
     metadata_lock = threading.Lock()
     stop_event = threading.Event()
 
-    captures_seen = _processed_capture_keys(_load_metadata())
-    renders_seen = _processed_render_keys()
+    captures_seen = _existing_image_keys(CAPTURES_DIR)
+    renders_seen = _existing_image_keys(RENDERS_DIR)
+    print(
+        f"Snapshot: ignoring {len(captures_seen)} pre-existing capture(s) "
+        f"and {len(renders_seen)} pre-existing render(s)."
+    )
 
     def on_new_capture(path: Path) -> None:
         process_capture(path, metadata_lock)
@@ -225,8 +231,12 @@ def main() -> None:
     print(f"Watching {_relative(CAPTURES_DIR)} -> cartoonize")
     print(f"Watching {_relative(RENDERS_DIR)} -> run_pipeline")
 
+    capture_done_t: Optional[float] = None
+    json_done_t: Optional[float] = None
+
     try:
         saved_path: Optional[Path] = capture_portrait(output_dir=CAPTURES_DIR)
+        capture_done_t = time.perf_counter()
         if saved_path is None:
             print("No capture saved; exiting.")
             return
@@ -238,6 +248,7 @@ def main() -> None:
         deadline = time.time() + PIPELINE_WAIT_SECONDS
         while time.time() < deadline:
             if expected_json.exists():
+                json_done_t = time.perf_counter()
                 print(f"Pipeline complete for {target_id}.")
                 break
             time.sleep(0.5)
@@ -247,6 +258,19 @@ def main() -> None:
         stop_event.set()
         capture_watcher.join(timeout=2.0)
         render_watcher.join(timeout=2.0)
+
+        print()
+        print("=== Pipeline latency ===")
+        if json_done_t is None:
+            print("  JSON output did not complete; no latency to report.")
+        else:
+            total_latency = json_done_t - script_start
+            print(f"  (1) script start  -> JSON complete: {total_latency:7.2f}s")
+            if capture_done_t is not None:
+                capture_to_json = json_done_t - capture_done_t
+                startup_to_capture = capture_done_t - script_start
+                print(f"  (2) photo taken   -> JSON complete: {capture_to_json:7.2f}s")
+                print(f"      (script start -> photo taken:   {startup_to_capture:7.2f}s)")
 
 
 if __name__ == "__main__":

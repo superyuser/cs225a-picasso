@@ -32,7 +32,7 @@ def _log(msg: str) -> None:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_PATH = SCRIPT_DIR / "prompts.json"
 
-DEFAULT_PROMPT_KEY = "best-image-gen"
+DEFAULT_PROMPT_KEY = "realistic"
 DEFAULT_MODEL = "gpt-image-1-mini"
 DEFAULT_SIZE = "1024x1024"
 DEFAULT_QUALITY = "low"

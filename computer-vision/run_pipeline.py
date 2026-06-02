@@ -1619,16 +1619,34 @@ def save_animation_gif(frames, out_path):
 
 
 def save_animation_mp4(frames, out_path, fps=16):
+    """Write an mp4 via imageio's ffmpeg plugin. Surfaces the real error on failure."""
+    if not frames:
+        print(f"[pipeline]   mp4 skipped (no frames): {out_path}", flush=True)
+        return
+
+    # h264 requires even width/height; macro_block_size=1 makes ffmpeg pad
+    # to the next even number instead of erroring on odd dimensions.
+    writer_kwargs = dict(
+        format="FFMPEG",
+        mode="I",
+        fps=fps,
+        codec="libx264",
+        quality=8,
+        macro_block_size=1,
+    )
+
     try:
-        writer = imageio.get_writer(out_path, fps=fps)
-
-        for fr in frames:
-            writer.append_data(fr)
-
-        writer.close()
-
-    except Exception as e:
-        print(f"[warning] MP4 export skipped: {e}")
+        with imageio.get_writer(out_path, **writer_kwargs) as writer:
+            for fr in frames:
+                writer.append_data(fr)
+        print(
+            f"[pipeline]   mp4 written: {out_path} ({len(frames)} frames @ {fps} fps)",
+            flush=True,
+        )
+    except Exception as exc:
+        import traceback
+        print(f"[pipeline]   MP4 export FAILED for {out_path}: {exc!r}", flush=True)
+        traceback.print_exc()
 
 
 # ============================================================

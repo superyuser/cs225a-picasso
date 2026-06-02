@@ -1,0 +1,90 @@
+# ============================================================
+# Secrets / environment
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ============================================================
+# Pipeline generated artifacts (computer-vision/)
+# ============================================================
+computer-vision/captures/
+computer-vision/art-renders/
+computer-vision/stroke-jsons/
+computer-vision/stroke-renders/
+computer-vision/metadata.json
+
+# Standalone webcam photos
+photos/
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ============================================================
+# Editors / IDEs
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================================
+# OS junk
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Misc large/generated media
+# ============================================================
+*.mp4
+*.avi
+*.mov
+*.gif
+*.webm
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+logs/
