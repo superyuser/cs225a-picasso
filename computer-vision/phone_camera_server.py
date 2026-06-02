@@ -259,13 +259,64 @@ INDEX_HTML = """<!doctype html>
 """
 
 
-def local_ip() -> str:
+def default_route_ip() -> str:
+    """Best-guess outbound IP (route to 8.8.8.8). May be the wrong one
+    on machines with multiple interfaces or active VPNs."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         try:
             sock.connect(("8.8.8.8", 80))
             return sock.getsockname()[0]
         except OSError:
             return "127.0.0.1"
+
+
+def list_local_ipv4_addresses() -> list[str]:
+    """Return every non-loopback IPv4 address bound on this machine.
+
+    The "default route" IP (whatever routes outbound) is first, then any
+    other IPv4 the OS reports. Phones sometimes can only reach a specific
+    interface (LAN Wi-Fi vs Ethernet vs VPN tunnel), so we print all of
+    them and let the user pick.
+    """
+    addrs: list[str] = []
+    seen: set[str] = set()
+
+    primary = default_route_ip()
+    if primary and primary != "127.0.0.1":
+        addrs.append(primary)
+        seen.add(primary)
+
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, family=socket.AF_INET):
+            ip = info[4][0]
+            if ip in seen or ip.startswith("127."):
+                continue
+            addrs.append(ip)
+            seen.add(ip)
+    except socket.gaierror:
+        pass
+
+    return addrs or ["127.0.0.1"]
+
+
+def _print_terminal_qr(url: str) -> None:
+    """Print a QR code for ``url`` to stdout if the ``qrcode`` package is available."""
+    try:
+        import qrcode
+    except ImportError:
+        print(
+            "  [--qr requested but `qrcode` is not installed. "
+            "Install with: pip install qrcode]",
+            flush=True,
+        )
+        return
+
+    qr = qrcode.QRCode(border=1, box_size=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+    qr.add_data(url)
+    qr.make(fit=True)
+    print(f"  Scan with phone camera (encodes {url}):", flush=True)
+    qr.print_ascii(invert=True)
 
 
 def make_capture_name() -> str:
@@ -447,7 +498,7 @@ class PhoneCameraHandler(BaseHTTPRequestHandler):
         )
 
 
-def serve(host: str, port: int, use_https: bool) -> None:
+def serve(host: str, port: int, use_https: bool, show_qr: bool = False) -> None:
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
     httpd = ThreadingHTTPServer((host, port), PhoneCameraHandler)
 
@@ -459,16 +510,46 @@ def serve(host: str, port: int, use_https: bool) -> None:
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    ip = local_ip()
-    print("Phone camera server running.", flush=True)
-    print(f"  Local:   {scheme}://127.0.0.1:{port}/", flush=True)
-    print(f"  Phone:   {scheme}://{ip}:{port}/", flush=True)
-    print(f"  Saves:   {CAPTURES_DIR}", flush=True)
-    if use_https:
-        print("  On the phone, accept the self-signed certificate warning once.", flush=True)
-    else:
-        print("  Warning: phone browsers may block camera access over plain HTTP.", flush=True)
+    addrs = list_local_ipv4_addresses()
+    primary_url = f"{scheme}://{addrs[0]}:{port}/"
 
+    print("Phone camera server running.", flush=True)
+    print(f"  Saves:   {CAPTURES_DIR}", flush=True)
+    print(f"  Local:   {scheme}://127.0.0.1:{port}/", flush=True)
+    print("  Phone URLs (try each if the first one doesn't load):", flush=True)
+    for ip in addrs:
+        print(f"    {scheme}://{ip}:{port}/", flush=True)
+
+    if use_https:
+        print(
+            "  Phone must be on the same Wi-Fi as this computer "
+            "and accept the self-signed certificate warning once.",
+            flush=True,
+        )
+    else:
+        print(
+            "  Warning: phone browsers may block camera access over plain HTTP.",
+            flush=True,
+        )
+
+    print("", flush=True)
+    print("  If the phone can't reach any URL above:", flush=True)
+    print("    1. Confirm phone Wi-Fi SSID matches this computer's.", flush=True)
+    print("    2. Some networks block device-to-device traffic (AP isolation).", flush=True)
+    print("       University / cafe / guest Wi-Fi often does this.", flush=True)
+    print("    3. Allow inbound traffic on this port (one-time, run in", flush=True)
+    print(f"       Admin PowerShell):", flush=True)
+    print(
+        f"         New-NetFirewallRule -DisplayName \"Phone camera server ({port})\" "
+        f"-Direction Inbound -Action Allow -Protocol TCP -LocalPort {port}",
+        flush=True,
+    )
+
+    if show_qr:
+        print("", flush=True)
+        _print_terminal_qr(primary_url)
+
+    print("", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -486,12 +567,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use plain HTTP instead of HTTPS. Most phone browsers block camera on HTTP.",
     )
+    parser.add_argument(
+        "--qr",
+        action="store_true",
+        help="Print a terminal QR code for the primary URL. Requires `pip install qrcode`.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    serve(args.host, args.port, use_https=not args.http)
+    serve(args.host, args.port, use_https=not args.http, show_qr=args.qr)
 
 
 if __name__ == "__main__":

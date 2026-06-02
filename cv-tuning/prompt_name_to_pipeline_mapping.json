@@ -1,0 +1,43 @@
+{
+    "_comment": "Per-prompt overrides for LineArtPipelineConfig. Any field name from cv-tuning/pipeline.py LineArtPipelineConfig is valid. Defaults apply for anything not listed. Tune freely.",
+
+    "simple": {
+        "threshold": 210,
+        "min_component_area": 100,
+        "open_kernel_size": 2,
+        "close_kernel_size": 1,
+        "prune_spur_iters": 18,
+        "min_stroke_length": 28.0,
+        "simplify_eps": 2.4,
+        "smooth_iterations": 2,
+        "max_points_per_stroke": 60,
+        "merge_endpoint_dist": 16.0,
+        "max_merge_passes": 6,
+        "save_debug_images": false,
+        "save_gif": false,
+        "save_mp4": false,
+        "verbose": false
+    },
+
+    "simpsons": {
+        "threshold": 200,
+        "min_component_area": 40,
+        "open_kernel_size": 1,
+        "close_kernel_size": 1,
+        "prune_spur_iters": 6,
+        "min_stroke_points": 3,
+        "min_stroke_length": 10.0,
+        "min_stroke_bbox_area": 10.0,
+        "simplify_eps": 1.4,
+        "smooth_iterations": 1,
+        "max_points_per_stroke": 120,
+        "merge_endpoint_dist": 18.0,
+        "max_merge_passes": 6,
+        "delete_tiny_strokes_near_eyes": false,
+        "tiny_near_eye_length": 15.0,
+        "save_debug_images": false,
+        "save_gif": false,
+        "save_mp4": false,
+        "verbose": false
+    }
+}

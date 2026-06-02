@@ -37,5 +37,74 @@
     "capture": "captures/phone_20260531T223009.jpg",
     "render": "art-renders/phone_20260531T223009.png",
     "rendered_at": "2026-05-31T22:30:23"
+  },
+  {
+    "id": "phone_20260601T203601",
+    "capture": "captures/phone_20260601T203601.jpg",
+    "render": "art-renders/phone_20260601T203601.png",
+    "rendered_at": "2026-06-01T20:36:20"
+  },
+  {
+    "id": "phone_20260601T210357",
+    "capture": "captures/phone_20260601T210357.jpg",
+    "render": "art-renders/phone_20260601T210357.png",
+    "rendered_at": "2026-06-01T21:04:17"
+  },
+  {
+    "id": "phone_20260601T210939",
+    "capture": "captures/phone_20260601T210939.jpg",
+    "render": "art-renders/phone_20260601T210939.png",
+    "rendered_at": "2026-06-01T21:09:56"
+  },
+  {
+    "id": "phone_20260601T211119",
+    "capture": "captures/phone_20260601T211119.jpg",
+    "render": "art-renders/phone_20260601T211119.png",
+    "rendered_at": "2026-06-01T21:11:36"
+  },
+  {
+    "id": "phone_20260601T211333",
+    "capture": "captures/phone_20260601T211333.jpg",
+    "render": "art-renders/phone_20260601T211333.png",
+    "rendered_at": "2026-06-01T21:13:52"
+  },
+  {
+    "id": "phone_20260601T211638",
+    "capture": "captures/phone_20260601T211638.jpg",
+    "render": "art-renders/phone_20260601T211638.png",
+    "rendered_at": "2026-06-01T21:16:57",
+    "strokes_json": "stroke-jsons/phone_20260601T211638.json",
+    "stroke_renders_dir": "stroke-renders/phone_20260601T211638",
+    "strokes_at": "2026-06-01T21:17:03"
+  },
+  {
+    "id": "phone_20260601T211801",
+    "capture": "captures/phone_20260601T211801.jpg",
+    "render": "art-renders/phone_20260601T211801.png",
+    "rendered_at": "2026-06-01T21:18:20"
+  },
+  {
+    "id": "phone_20260601T212115",
+    "capture": "captures/phone_20260601T212115.jpg",
+    "render": "art-renders/phone_20260601T212115.png",
+    "rendered_at": "2026-06-01T21:21:34"
+  },
+  {
+    "id": "phone_20260601T212216",
+    "capture": "captures/phone_20260601T212216.jpg",
+    "render": "art-renders/phone_20260601T212216.png",
+    "rendered_at": "2026-06-01T21:22:33"
+  },
+  {
+    "id": "phone_20260601T212351",
+    "capture": "captures/phone_20260601T212351.jpg",
+    "render": "art-renders/phone_20260601T212351.png",
+    "rendered_at": "2026-06-01T21:24:11"
+  },
+  {
+    "id": "phone_20260601T213454",
+    "capture": "captures/phone_20260601T213454.jpg",
+    "render": "art-renders/phone_20260601T213454.png",
+    "rendered_at": "2026-06-01T21:35:13"
   }
 ]

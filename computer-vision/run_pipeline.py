@@ -63,9 +63,10 @@ DEFAULT_RENDERS_DIR = SCRIPT_DIR / "stroke-renders"
 # ----------------------------
 # Binary / raster cleanup
 # ----------------------------
-THRESHOLD = 210
+# Tuned in cv-tuning/ for the "best-image-gen" (Simpsons-style) prompt.
+THRESHOLD = 200
 
-MIN_COMPONENT_AREA = 100
+MIN_COMPONENT_AREA = 30
 OPEN_KERNEL_SIZE = 2
 CLOSE_KERNEL_SIZE = 1
 BBOX_PAD = 20
@@ -73,7 +74,8 @@ BBOX_PAD = 20
 # ----------------------------
 # Skeleton cleanup
 # ----------------------------
-PRUNE_SPUR_ITERS = 18
+# Tuned in cv-tuning/ for the "best-image-gen" (Simpsons-style) prompt.
+PRUNE_SPUR_ITERS = 12
 MIN_BRANCH_PIXELS = 8
 
 # ----------------------------
@@ -105,10 +107,11 @@ IRIS_FROM_GLASSES_RATIO = 1.0 / 3.0
 # ----------------------------
 # Stroke extraction / simplification
 # ----------------------------
-MIN_STROKE_POINTS = 4
-MIN_STROKE_LENGTH = 28.0
-MIN_STROKE_BBOX_AREA = 30.0
-SIMPLIFY_EPS = 2.4
+# Tuned in cv-tuning/ for the "best-image-gen" (Simpsons-style) prompt.
+MIN_STROKE_POINTS = 3
+MIN_STROKE_LENGTH = 10.0
+MIN_STROKE_BBOX_AREA = 10.0
+SIMPLIFY_EPS = 1.4
 CLOSE_THRESH = 4.0
 
 # ----------------------------
@@ -116,17 +119,18 @@ CLOSE_THRESH = 4.0
 # ----------------------------
 ENABLE_STROKE_SMOOTHING = True
 
-SMOOTH_ITERATIONS = 2
+# Tuned in cv-tuning/ for the "best-image-gen" (Simpsons-style) prompt.
+SMOOTH_ITERATIONS = 1
 POST_SMOOTH_SIMPLIFY_EPS = 2.0
 
 # Robot interpolates between control points, so this can stay low.
-MAX_POINTS_PER_STROKE = 60
+MAX_POINTS_PER_STROKE = 120
 
 ENABLE_STROKE_MERGING = True
 MAX_MERGE_PASSES = 6
 
 # Endpoint distance threshold in pixels.
-MERGE_ENDPOINT_DIST = 16.0
+MERGE_ENDPOINT_DIST = 18.0
 
 MERGE_ALLOWED_FEATURES = {
     "outer_contour",
@@ -174,8 +178,11 @@ MERGE_CONNECTOR_MAX_CONTROL_FRAC = 0.45
 # ----------------------------
 # Geometric junk deletion
 # ----------------------------
-DELETE_TINY_STROKES_NEAR_EYES = True
-TINY_NEAR_EYE_LENGTH = 45.0
+# Tuned in cv-tuning/ for the "best-image-gen" (Simpsons-style) prompt.
+# Detail near the eyes (pupils, eyebrow tips, glasses bridge) is too
+# important for this style to wipe with a blanket "tiny near eye" filter.
+DELETE_TINY_STROKES_NEAR_EYES = False
+TINY_NEAR_EYE_LENGTH = 15.0
 TINY_NEAR_EYE_BBOX_AREA = 100.0
 
 DELETE_TOP_BORDER_ARTIFACTS = True
