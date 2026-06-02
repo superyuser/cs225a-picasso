@@ -3,32 +3,32 @@
   "description": "Raw canvas corner calibration points in robot/world XYZ coordinates.",
   "raw_corners_xyz": {
     "TL": [
-      0.76069,
-      0.24867,
-      0.53044
+      0.76819,
+      0.26294,
+      0.53548
     ],
     "TR": [
-      0.77021,
-      -0.04959,
-      0.53004
+      0.77234,
+      -0.04392,
+      0.5337
     ],
     "BR": [
-      0.66239,
-      -0.05392,
-      0.25416
+      0.66413,
+      -0.03884,
+      0.25764
     ],
     "BL": [
-      0.65313,
-      0.2463,
-      0.25562
+      0.65929,
+      0.25912,
+      0.25585
     ]
   },
   "stroke_plane_offset_xyz_m": [
-    -0.012,
+    -0.024,
     0.0,
     0.0
   ],
-  "calibration_captured_at": "2026-06-02T04:44:31",
+  "calibration_captured_at": "2026-06-02T16:00:08",
   "calibration_source_images": {
     "TL": "calibration/captures/TL.jpg",
     "TR": "calibration/captures/TR.jpg",
