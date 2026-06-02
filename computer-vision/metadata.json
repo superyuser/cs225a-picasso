@@ -106,5 +106,47 @@
     "capture": "captures/phone_20260601T213454.jpg",
     "render": "art-renders/phone_20260601T213454.png",
     "rendered_at": "2026-06-01T21:35:13"
+  },
+  {
+    "id": "phone_20260602T045854",
+    "capture": "captures/phone_20260602T045854.jpg",
+    "render": "art-renders/phone_20260602T045854.png",
+    "rendered_at": "2026-06-02T04:59:17"
+  },
+  {
+    "id": "phone_20260602T050340",
+    "capture": "captures/phone_20260602T050340.jpg",
+    "render": "art-renders/phone_20260602T050340.png",
+    "rendered_at": "2026-06-02T05:04:06"
+  },
+  {
+    "id": "phone_20260602T051018",
+    "capture": "captures/phone_20260602T051018.jpg",
+    "render": "art-renders/phone_20260602T051018.png",
+    "rendered_at": "2026-06-02T05:10:38"
+  },
+  {
+    "id": "phone_20260602T051154",
+    "capture": "captures/phone_20260602T051154.jpg",
+    "render": "art-renders/phone_20260602T051154.png",
+    "rendered_at": "2026-06-02T05:12:09"
+  },
+  {
+    "id": "phone_20260602T051634",
+    "capture": "captures/phone_20260602T051634.jpg",
+    "render": "art-renders/phone_20260602T051634.png",
+    "rendered_at": "2026-06-02T05:16:51"
+  },
+  {
+    "id": "phone_20260602T052712",
+    "capture": "captures/phone_20260602T052712.jpg",
+    "render": "art-renders/phone_20260602T052712.png",
+    "rendered_at": "2026-06-02T05:27:53"
+  },
+  {
+    "id": "phone_20260602T053046",
+    "capture": "captures/phone_20260602T053046.jpg",
+    "render": "art-renders/phone_20260602T053046.png",
+    "rendered_at": "2026-06-02T05:31:02"
   }
 ]

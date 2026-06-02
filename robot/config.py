@@ -18,7 +18,7 @@ POS_TOL_M = 1.0e-2  # 10 mm
 
 # Segment interpolation resolution.
 # Smaller = more intermediate waypoints = slower/smoother.
-TRAVEL_STEP_M = 0.006   # free-space travel / lift moves
+TRAVEL_STEP_M = 0.012  #ree-space travel / lift moves
 DRAW_STEP_M = 0.003     # drawing motion on paper
 
 # Retraction direction.
@@ -28,7 +28,7 @@ DRAW_STEP_M = 0.003     # drawing motion on paper
 #
 # Units are meters.
 # -0.1 = -10 cm in world x.
-RETRACT_X_M = -0.05
+RETRACT_X_M = -0.03
 RETRACT_VEC = np.array([RETRACT_X_M, 0.0, 0.0], dtype=float)
 
 # INIT position from calibration.

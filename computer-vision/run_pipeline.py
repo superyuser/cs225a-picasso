@@ -66,7 +66,7 @@ DEFAULT_RENDERS_DIR = SCRIPT_DIR / "stroke-renders"
 # Tuned in cv-tuning/ for the "best-image-gen" (Simpsons-style) prompt.
 THRESHOLD = 200
 
-MIN_COMPONENT_AREA = 30
+MIN_COMPONENT_AREA = 15
 OPEN_KERNEL_SIZE = 2
 CLOSE_KERNEL_SIZE = 1
 BBOX_PAD = 20
