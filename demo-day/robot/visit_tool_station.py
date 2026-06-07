@@ -50,6 +50,10 @@ from helpers.primitives import (
     swirl_water,
     wipe_napkin,
 )
+from helpers.tool_station_coords import (
+    seed_cartesian_goal_at_current,
+    switch_to_cartesian_hold_current,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -69,6 +73,7 @@ JOINT_ARRIVAL_THRESHOLD = 0.25
 JOINT_MAX_STEP_DEG = 0.5
 JOINT_CONTROLLER_SETTLE_S = 0.25
 CARTESIAN_SETTLE_S = 0.25
+CARTESIAN_MAX_STEP_M = 0.002
 DWELL_AT_TOOL_INIT_S = 0.5
 DWELL_AT_PAINT_HOVER_S = 0.25
 DWELL_AT_PAINT_DIP_S = 0.5
@@ -461,6 +466,10 @@ def move_cartesian_to_target(
     path_trace: list[PathTraceSample] | None = None,
     trace_start: float | None = None,
 ) -> bool:
+    seed_cartesian_goal_at_current(
+        redis_client,
+        hold_orientation=hold_orientation,
+    )
     set_cartesian_goal(redis_client, target_position, hold_orientation)
     loop_time = 0.0
     last_status = 0.0
@@ -499,6 +508,125 @@ def move_cartesian_to_target(
             print(f"Timed out before reaching {label}.")
             print("Final position error:", round(err, 5))
             return False
+
+
+def move_cartesian_to_target_smooth(
+    redis_client,
+    *,
+    target_position: np.ndarray,
+    hold_orientation: np.ndarray,
+    label: str,
+    pos_tol_m: float,
+    status_period_s: float,
+    timeout_s: float,
+    start_time: float,
+    path_trace: list[PathTraceSample] | None = None,
+    trace_start: float | None = None,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+) -> bool:
+    """Stream a continuous Cartesian goal from the live current pose to target."""
+    start_position = read_np(
+        redis_client,
+        redis_keys.cartesian_task_current_position,
+        (3,),
+    )
+
+    target_position = np.asarray(target_position, dtype=float)
+    hold_orientation = np.asarray(hold_orientation, dtype=float)
+
+    delta = target_position - start_position
+    distance = float(np.linalg.norm(delta))
+
+    if distance < pos_tol_m:
+        print(f"{label}: already within tolerance.")
+        return True
+
+    num_steps = max(1, int(math.ceil(distance / max_cartesian_step_m)))
+
+    print(f"Moving smoothly to {label}...")
+    print("  live start position:", np.round(start_position, 5))
+    print("  target position:    ", np.round(target_position, 5))
+    print("  distance m:         ", round(distance, 5))
+    print("  Cartesian samples:  ", num_steps + 1)
+
+    loop_time = 0.0
+    last_status = 0.0
+    time.sleep(0.01)
+    init_time = time.perf_counter_ns() * 1e-9
+
+    for step_idx in range(1, num_steps + 1):
+        loop_time += DT
+        time.sleep(
+            max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
+        )
+
+        u = step_idx / num_steps
+        s = 3.0 * u * u - 2.0 * u * u * u
+
+        commanded_position = start_position + s * delta
+        set_cartesian_goal(redis_client, commanded_position, hold_orientation)
+
+        current_position = read_np(
+            redis_client,
+            redis_keys.cartesian_task_current_position,
+            (3,),
+        )
+
+        if path_trace is not None and trace_start is not None:
+            append_path_trace(
+                path_trace,
+                trace_start=trace_start,
+                phase=label,
+                position=current_position,
+            )
+
+        err_to_final = position_error(current_position, target_position)
+        err_to_command = position_error(current_position, commanded_position)
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                f"SMOOTH_MOVING_TO_{label}",
+                "| sample:",
+                f"{step_idx}/{num_steps}",
+                "| final_error:",
+                round(err_to_final, 5),
+                "| tracking_error:",
+                round(err_to_command, 5),
+            )
+            last_status = loop_time
+
+        if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+            print(f"Timed out while streaming smooth Cartesian path to {label}.")
+            print("Final position error:", round(err_to_final, 5))
+            return False
+
+    while True:
+        current_position = read_np(
+            redis_client,
+            redis_keys.cartesian_task_current_position,
+            (3,),
+        )
+
+        if path_trace is not None and trace_start is not None:
+            append_path_trace(
+                path_trace,
+                trace_start=trace_start,
+                phase=f"{label}_SETTLE",
+                position=current_position,
+            )
+
+        err = position_error(current_position, target_position)
+        set_cartesian_goal(redis_client, target_position, hold_orientation)
+
+        if err < pos_tol_m:
+            return True
+
+        if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+            print(f"Timed out before settling at {label}.")
+            print("Final position error:", round(err, 5))
+            return False
+
+        time.sleep(DT)
 
 
 def cubic_hermite(
@@ -1204,6 +1332,7 @@ def make_cartesian_move_fn(
     pos_tol_m: float,
     path_trace: list[PathTraceSample] | None = None,
     trace_start: float | None = None,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
 ):
     def move_fn(
         redis_client,
@@ -1216,7 +1345,7 @@ def make_cartesian_move_fn(
         status_period_s: float,
     ) -> bool:
         start = time.perf_counter()
-        ok = move_cartesian_to_target(
+        ok = move_cartesian_to_target_smooth(
             redis_client,
             target_position=target_pos,
             hold_orientation=hold_orientation,
@@ -1227,6 +1356,7 @@ def make_cartesian_move_fn(
             start_time=start,
             path_trace=path_trace,
             trace_start=trace_start,
+            max_cartesian_step_m=max_cartesian_step_m,
         )
         if ok and dwell_s > 0.0:
             time.sleep(dwell_s)
@@ -1245,40 +1375,25 @@ def run_paint_dip_sequence(
     timeout_s: float = TIMEOUT_S,
     path_trace: list[PathTraceSample] | None = None,
     trace_start: float | None = None,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
 ) -> bool:
     cfg = load_demo_day_config()
-    hold_orientation = read_np(
-        redis_client,
-        redis_keys.cartesian_task_current_orientation,
-        (3, 3),
-    )
-    current_position = read_np(
-        redis_client,
-        redis_keys.cartesian_task_current_position,
-        (3,),
-    )
 
-    print("Switching to Cartesian controller for paint-station visits.")
-    print("Holding current Cartesian orientation throughout.")
-    print("Current Cartesian position:", np.round(current_position, 5))
+    print("Preparing Cartesian motion from measured TOOL_INIT pose.")
+    current_position, hold_orientation = switch_to_cartesian_hold_current(
+        redis_client,
+        settle_s=CARTESIAN_SETTLE_S,
+    )
     print(
         "z_dive_in_offset (mm):",
         round(load_z_dive_in_offset_m(cfg) * 1000.0, 3),
     )
 
-    set_cartesian_goal(redis_client, current_position, hold_orientation)
-    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
-    print("Using controller:", CARTESIAN_CONTROLLER)
-
-    settle_start = time.perf_counter()
-    while time.perf_counter() - settle_start < CARTESIAN_SETTLE_S:
-        set_cartesian_goal(redis_client, current_position, hold_orientation)
-        time.sleep(DT)
-
     move_fn = make_cartesian_move_fn(
         pos_tol_m=pos_tol_m,
         path_trace=path_trace,
         trace_start=trace_start,
+        max_cartesian_step_m=max_cartesian_step_m,
     )
     sequence_start = time.perf_counter()
 
@@ -1293,7 +1408,7 @@ def run_paint_dip_sequence(
         print(f"  {label}: {np.round(target_pos, 5).tolist()} m")
 
     for label, target_pos, dip_fn in paint_legs:
-        if not move_cartesian_to_target(
+        if not move_cartesian_to_target_smooth(
             redis_client,
             target_position=target_pos,
             hold_orientation=hold_orientation,
@@ -1304,6 +1419,7 @@ def run_paint_dip_sequence(
             start_time=sequence_start,
             path_trace=path_trace,
             trace_start=trace_start,
+            max_cartesian_step_m=max_cartesian_step_m,
         ):
             return False
 
@@ -1324,7 +1440,7 @@ def run_paint_dip_sequence(
             return False
 
     water_pos = load_paint_init_pos_m(cfg, "WATER_INIT_POS")
-    if not move_cartesian_to_target(
+    if not move_cartesian_to_target_smooth(
         redis_client,
         target_position=water_pos,
         hold_orientation=hold_orientation,
@@ -1335,6 +1451,7 @@ def run_paint_dip_sequence(
         start_time=sequence_start,
         path_trace=path_trace,
         trace_start=trace_start,
+        max_cartesian_step_m=max_cartesian_step_m,
     ):
         return False
 
@@ -1355,7 +1472,7 @@ def run_paint_dip_sequence(
         return False
 
     napkin_approach_pos = load_paint_init_pos_m(cfg, "WATER_TO_NAPKIN_INIT_POS")
-    if not move_cartesian_to_target(
+    if not move_cartesian_to_target_smooth(
         redis_client,
         target_position=napkin_approach_pos,
         hold_orientation=hold_orientation,
@@ -1366,6 +1483,7 @@ def run_paint_dip_sequence(
         start_time=sequence_start,
         path_trace=path_trace,
         trace_start=trace_start,
+        max_cartesian_step_m=max_cartesian_step_m,
     ):
         return False
 
@@ -1401,6 +1519,7 @@ def move_to_tool_init(
     path_log_dir: Path = DEFAULT_PATH_LOG_DIR,
     use_cached_tool_init_path: bool = True,
     rebuild_tool_init_path: bool = False,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
 ) -> int:
     path_trace: list[PathTraceSample] = []
     trace_start = time.perf_counter()
@@ -1438,6 +1557,7 @@ def move_to_tool_init(
         timeout_s=timeout_s,
         path_trace=path_trace,
         trace_start=trace_start,
+        max_cartesian_step_m=max_cartesian_step_m,
     ):
         return finish(1)
     return finish(0)
@@ -1515,6 +1635,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not load the cached INIT_POS -> TOOL_INIT joint path JSON.",
     )
+    parser.add_argument(
+        "--cartesian-max-step-m",
+        type=float,
+        default=CARTESIAN_MAX_STEP_M,
+        help=(
+            "Maximum Cartesian goal step per 10 ms tick when streaming to "
+            f"paint-station waypoints (default: {CARTESIAN_MAX_STEP_M})."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1533,6 +1662,7 @@ def main() -> int:
             path_log_dir=Path(args.path_log_dir),
             use_cached_tool_init_path=not args.no_cached_tool_init_path,
             rebuild_tool_init_path=args.rebuild_tool_init_path,
+            max_cartesian_step_m=args.cartesian_max_step_m,
         )
     except RuntimeError as exc:
         print("Could not start tool-station run:")

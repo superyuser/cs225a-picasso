@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
@@ -31,19 +30,15 @@ from .primitives import (
 )
 from .tool_station_coords import (
     CARTESIAN_SETTLE_S,
-    DT,
     POS_TOL_M,
     go_to_waypoint,
-    read_np,
-    redis_keys,
-    set_active_controller,
-    set_cartesian_goal,
+    switch_to_cartesian_hold_current,
 )
 
-CARTESIAN_CONTROLLER = "cartesian_controller"
 DEFAULT_HOVER_DWELL_S = 0.25
 DEFAULT_DIP_DWELL_S = 0.5
 STATUS_PERIOD_S = 0.25
+
 
 DIP_PAINT_BY_NUMBER: dict[int, Callable[..., bool]] = {
     1: dip_paint_1,
@@ -123,26 +118,10 @@ def _prepare_cartesian_motion(
     *,
     status_period_s: float,
 ) -> np.ndarray:
-    hold_orientation = read_np(
+    _position, hold_orientation = switch_to_cartesian_hold_current(
         redis_client,
-        redis_keys.cartesian_task_current_orientation,
-        (3, 3),
+        settle_s=CARTESIAN_SETTLE_S,
     )
-    current_position = read_np(
-        redis_client,
-        redis_keys.cartesian_task_current_position,
-        (3,),
-    )
-
-    set_cartesian_goal(redis_client, current_position, hold_orientation)
-    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
-    print("Using controller:", CARTESIAN_CONTROLLER)
-
-    settle_start = time.perf_counter()
-    while time.perf_counter() - settle_start < CARTESIAN_SETTLE_S:
-        set_cartesian_goal(redis_client, current_position, hold_orientation)
-        time.sleep(DT)
-
     return hold_orientation
 
 

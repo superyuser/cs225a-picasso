@@ -157,6 +157,62 @@ def position_error(current_pos, goal_pos) -> float:
     )
 
 
+def read_cartesian_pose(redis_client) -> tuple[np.ndarray, np.ndarray]:
+    position = read_np(
+        redis_client,
+        redis_keys.cartesian_task_current_position,
+        (3,),
+    )
+    orientation = read_np(
+        redis_client,
+        redis_keys.cartesian_task_current_orientation,
+        (3, 3),
+    )
+    return position, orientation
+
+
+def seed_cartesian_goal_at_current(
+    redis_client,
+    *,
+    hold_orientation: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Set the Cartesian goal to the live measured pose before a new target."""
+    current_position, current_orientation = read_cartesian_pose(redis_client)
+    orientation = (
+        hold_orientation
+        if hold_orientation is not None
+        else current_orientation
+    )
+    set_cartesian_goal(redis_client, current_position, orientation)
+    time.sleep(DT)
+    return current_position, orientation
+
+
+def switch_to_cartesian_hold_current(
+    redis_client,
+    *,
+    settle_s: float = CARTESIAN_SETTLE_S,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Activate cartesian control while tracking the measured EE pose."""
+    current_position, hold_orientation = read_cartesian_pose(redis_client)
+
+    print("Switching to Cartesian controller at measured pose.")
+    print("Current Cartesian position:", np.round(current_position, 5))
+    print("Holding current Cartesian orientation.")
+
+    set_cartesian_goal(redis_client, current_position, hold_orientation)
+    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
+    print("Using controller:", CARTESIAN_CONTROLLER)
+
+    settle_start = time.perf_counter()
+    while time.perf_counter() - settle_start < settle_s:
+        current_position, hold_orientation = read_cartesian_pose(redis_client)
+        set_cartesian_goal(redis_client, current_position, hold_orientation)
+        time.sleep(DT)
+
+    return current_position, hold_orientation
+
+
 # ---------------------------------------------------------------------------
 # Coordinate transforms
 # ---------------------------------------------------------------------------
@@ -389,6 +445,10 @@ def go_to_waypoint(
     status_period_s: float,
 ) -> bool:
     print(f"\n-> {label}: target = {np.round(target_pos, 5).tolist()}")
+    seed_cartesian_goal_at_current(
+        redis_client,
+        hold_orientation=hold_orientation,
+    )
     set_cartesian_goal(redis_client, target_pos, hold_orientation)
 
     loop_time = 0.0
