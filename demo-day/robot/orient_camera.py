@@ -1,18 +1,31 @@
-"""Open the camera stream, translate to CAMERA_INIT, then rotate the last joint."""
+"""Open the camera stream, translate to CAMERA_INIT, rotate the last joint,
+then track the closest detected face by commanding the last joint in real time.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
+from pathlib import Path
 
 import cv2
 import numpy as np
 
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEMO_DAY_DIR = SCRIPT_DIR.parent
+DEFAULT_RAW_CAPTURES_DIR = DEMO_DAY_DIR / "raw-captures"
+
+# How many consecutive frames the face must remain inside the centered deadband
+# before we save the raw capture and stop. At ~30 fps this is roughly 0.6 s.
+CENTERED_FRAMES_REQUIRED = 18
 
 DEFAULT_CAMERA_INDEX = 0
 PREVIEW_WINDOW = "Camera Preview"
@@ -33,6 +46,17 @@ JOINT_ARRIVAL_THRESHOLD = 8.0e-2
 JOINT_MAX_STEP_DEG = 0.5
 JOINT_CONTROLLER_SETTLE_S = 0.25
 
+# Face tracking parameters.
+FACE_CENTER_DEADBAND_PX = 35
+FACE_TRACKING_GAIN_DEG_PER_NORM_PX = 1.5
+FACE_TRACKING_MAX_STEP_DEG = 0.15
+FACE_DETECTION_SCALE_FACTOR = 1.1
+FACE_DETECTION_MIN_NEIGHBORS = 5
+FACE_DETECTION_MIN_SIZE = (60, 60)
+
+# If the camera moves away from the detected face, change this to -1.0.
+FACE_TRACKING_SIGN = 1.0
+
 CAMERA_INIT_POS_MM = np.array([-310.22, 592.11, 340.43], dtype=float)
 CAMERA_INIT_POS_M = CAMERA_INIT_POS_MM / 1000.0
 
@@ -40,6 +64,7 @@ CAMERA_INIT_POS_M = CAMERA_INIT_POS_MM / 1000.0
 class CameraState(Enum):
     TRANSLATING = auto()
     ROTATING_LAST_JOINT = auto()
+    FACE_TRACKING = auto()
     DONE = auto()
 
 
@@ -185,8 +210,6 @@ def build_xy_arc_path(
     bulge_sign = 1.0 if side == "left" else -1.0
     bulge_normal = bulge_sign * left_normal
 
-    # Put the circle center opposite the intended bulge so the minor arc bows
-    # toward ``bulge_normal``.
     center = (start_xy + target_xy) / 2.0 - bulge_normal * center_offset
 
     start_angle = math.atan2(start_xy[1] - center[1], start_xy[0] - center[0])
@@ -246,6 +269,54 @@ def build_translation_path(
     return right_path, right_radius, "right"
 
 
+def make_raw_capture_name() -> str:
+    return datetime.now().strftime("%Y%m%dT%H%M%S") + ".jpg"
+
+
+def save_raw_capture(frame: np.ndarray, captures_dir: Path) -> Path:
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    out_path = captures_dir / make_raw_capture_name()
+    suffix = 1
+    while out_path.exists():
+        out_path = captures_dir / (out_path.stem + f"_{suffix}.jpg")
+        suffix += 1
+    cv2.imwrite(str(out_path), frame)
+    return out_path
+
+
+def create_face_detector() -> cv2.CascadeClassifier:
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(cascade_path)
+
+    if detector.empty():
+        raise RuntimeError(f"Could not load Haar cascade: {cascade_path}")
+
+    return detector
+
+
+def detect_closest_face(
+    frame: np.ndarray,
+    detector: cv2.CascadeClassifier,
+) -> tuple[int, int, int, int] | None:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+
+    faces = detector.detectMultiScale(
+        gray,
+        scaleFactor=FACE_DETECTION_SCALE_FACTOR,
+        minNeighbors=FACE_DETECTION_MIN_NEIGHBORS,
+        minSize=FACE_DETECTION_MIN_SIZE,
+    )
+
+    if len(faces) == 0:
+        return None
+
+    # Monocular closest-face approximation:
+    # larger detected face bounding box area usually means closer to camera.
+    x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
+    return int(x), int(y), int(w), int(h)
+
+
 def open_camera(camera_index: int) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(camera_index)
 
@@ -266,14 +337,19 @@ def open_camera(camera_index: int) -> cv2.VideoCapture:
     return cap
 
 
-def update_camera_stream(cap: cv2.VideoCapture, *, preview: bool, label: str) -> bool:
+def update_camera_stream(
+    cap: cv2.VideoCapture,
+    *,
+    preview: bool,
+    label: str,
+) -> tuple[bool, np.ndarray | None]:
     ok, frame = cap.read()
     if not ok:
         print("Could not read from camera stream.")
-        return False
+        return False, None
 
     if not preview:
-        return True
+        return True, frame
 
     cv2.putText(
         frame,
@@ -287,7 +363,89 @@ def update_camera_stream(cap: cv2.VideoCapture, *, preview: bool, label: str) ->
     cv2.imshow(PREVIEW_WINDOW, frame)
 
     key = cv2.waitKey(1) & 0xFF
-    return key not in (27, ord("q"))
+    return key not in (27, ord("q")), frame
+
+
+def draw_face_tracking_overlay(
+    frame: np.ndarray,
+    *,
+    state_label: str,
+    face_box: tuple[int, int, int, int] | None,
+    error_x_px: float | None,
+    error_y_px: float | None,
+    joint_step_deg: float,
+) -> None:
+    height, width = frame.shape[:2]
+    image_center_x = width / 2.0
+    image_center_y = height / 2.0
+
+    cv2.putText(
+        frame,
+        state_label,
+        (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 255, 0),
+        2,
+    )
+
+    cv2.drawMarker(
+        frame,
+        (int(image_center_x), int(image_center_y)),
+        (255, 255, 255),
+        markerType=cv2.MARKER_CROSS,
+        markerSize=25,
+        thickness=2,
+    )
+
+    if face_box is not None:
+        x, y, w, h = face_box
+        face_center_x = x + w / 2.0
+        face_center_y = y + h / 2.0
+
+        cv2.rectangle(
+            frame,
+            (x, y),
+            (x + w, y + h),
+            (0, 255, 0),
+            2,
+        )
+
+        cv2.circle(
+            frame,
+            (int(face_center_x), int(face_center_y)),
+            5,
+            (0, 255, 0),
+            -1,
+        )
+
+        cv2.line(
+            frame,
+            (int(image_center_x), int(image_center_y)),
+            (int(face_center_x), int(face_center_y)),
+            (0, 255, 0),
+            2,
+        )
+
+        cv2.putText(
+            frame,
+            f"dx={error_x_px:.1f}, dy={error_y_px:.1f}, dJ7={joint_step_deg:.4f} deg",
+            (30, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+    else:
+        cv2.putText(
+            frame,
+            "no face detected: holding pose",
+            (30, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+        )
 
 
 def preview_camera_stream(camera_index: int = DEFAULT_CAMERA_INDEX) -> bool:
@@ -297,7 +455,14 @@ def preview_camera_stream(camera_index: int = DEFAULT_CAMERA_INDEX) -> bool:
         cap = open_camera(camera_index)
         print("Press q or Esc in the preview window to stop.")
 
-        while update_camera_stream(cap, preview=True, label="Camera preview"):
+        while True:
+            keep_running, _frame = update_camera_stream(
+                cap,
+                preview=True,
+                label="Camera preview",
+            )
+            if not keep_running:
+                break
             time.sleep(0.001)
 
         return True
@@ -332,11 +497,15 @@ def move_to_camera_init(
     joint_arrival_threshold: float = JOINT_ARRIVAL_THRESHOLD,
     joint_max_step_deg: float = JOINT_MAX_STEP_DEG,
     joint_controller_settle_s: float = JOINT_CONTROLLER_SETTLE_S,
+    capture_when_centered: bool = True,
+    raw_captures_dir: str | os.PathLike[str] = DEFAULT_RAW_CAPTURES_DIR,
 ) -> bool:
     cap: cv2.VideoCapture | None = None
+    raw_captures_dir = Path(raw_captures_dir)
 
     try:
         cap = open_camera(camera_index)
+        face_detector = create_face_detector()
 
         import redis
 
@@ -386,6 +555,11 @@ def move_to_camera_init(
 
         joint_goal = None
         commanded_joint_position = None
+        face_tracking_commanded_joint_position = None
+
+        centered_frame_count = 0
+        saved_raw_capture_path: Path | None = None
+
         max_joint_step = max(abs(joint_max_step_deg) * DEG_TO_RAD, 1.0e-5)
 
         loop_time = 0.0
@@ -396,9 +570,15 @@ def move_to_camera_init(
             loop_time += DT
             time.sleep(max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time)))
 
-            if not update_camera_stream(cap, preview=preview, label=state.name):
-                print("Camera stream stopped. Exiting.")
-                return False
+            if state != CameraState.FACE_TRACKING:
+                keep_running, _frame = update_camera_stream(
+                    cap,
+                    preview=preview,
+                    label=state.name,
+                )
+                if not keep_running:
+                    print("Camera stream stopped. Exiting.")
+                    return False
 
             if state == CameraState.TRANSLATING:
                 current_position = read_np(
@@ -491,9 +671,133 @@ def move_to_camera_init(
                 )
 
                 if joint_error < joint_arrival_threshold:
-                    state = CameraState.DONE
+                    state = CameraState.FACE_TRACKING
+                    face_tracking_commanded_joint_position = current_joint_position.copy()
+                    set_joint_goal(redis_client, face_tracking_commanded_joint_position)
                     print("Reached target last-joint position.")
+                    print("Phase 3: face tracking. Press q or Esc in preview window to stop.")
+                    print(
+                        "If tracking moves away from the face, set FACE_TRACKING_SIGN = -1.0."
+                    )
+
+            elif state == CameraState.FACE_TRACKING:
+                ok, frame = cap.read()
+                if not ok:
+                    print("Could not read from camera stream.")
+                    return False
+
+                clean_frame = frame.copy()
+
+                face_box = detect_closest_face(frame, face_detector)
+
+                current_joint_position = read_np(
+                    redis_client,
+                    redis_keys.sensor_joint_positions,
+                    (7,),
+                )
+
+                if face_tracking_commanded_joint_position is None:
+                    face_tracking_commanded_joint_position = current_joint_position.copy()
+
+                height, width = frame.shape[:2]
+                image_center_x = width / 2.0
+                image_center_y = height / 2.0
+
+                error_x_px = None
+                error_y_px = None
+                joint_step_deg = 0.0
+                raw_error_x_px = None
+
+                if face_box is not None:
+                    x, y, w, h = face_box
+
+                    face_center_x = x + w / 2.0
+                    face_center_y = y + h / 2.0
+
+                    raw_error_x_px = face_center_x - image_center_x
+                    error_x_px = raw_error_x_px
+                    error_y_px = face_center_y - image_center_y
+
+                    if abs(error_x_px) < FACE_CENTER_DEADBAND_PX:
+                        error_x_px = 0.0
+
+                    normalized_error_x = error_x_px / (width / 2.0)
+
+                    joint_step_deg = (
+                        FACE_TRACKING_SIGN
+                        * FACE_TRACKING_GAIN_DEG_PER_NORM_PX
+                        * normalized_error_x
+                    )
+
+                    joint_step_deg = float(
+                        np.clip(
+                            joint_step_deg,
+                            -FACE_TRACKING_MAX_STEP_DEG,
+                            FACE_TRACKING_MAX_STEP_DEG,
+                        )
+                    )
+
+                    face_tracking_commanded_joint_position[-1] += joint_step_deg * DEG_TO_RAD
+
+                    if abs(raw_error_x_px) < FACE_CENTER_DEADBAND_PX:
+                        centered_frame_count += 1
+                    else:
+                        centered_frame_count = 0
+
+                    print(
+                        "FACE_TRACKING",
+                        "| error_x_px:",
+                        round(error_x_px, 1),
+                        "| error_y_px:",
+                        round(error_y_px, 1),
+                        "| joint_step_deg:",
+                        round(joint_step_deg, 4),
+                        "| measured_last_joint_deg:",
+                        round(current_joint_position[-1] / DEG_TO_RAD, 3),
+                        "| commanded_last_joint_deg:",
+                        round(face_tracking_commanded_joint_position[-1] / DEG_TO_RAD, 3),
+                        "| centered_frames:",
+                        centered_frame_count,
+                        "/",
+                        CENTERED_FRAMES_REQUIRED,
+                    )
+
+                else:
+                    centered_frame_count = 0
+                    print("FACE_TRACKING | no face detected | holding pose")
+
+                set_joint_goal(redis_client, face_tracking_commanded_joint_position)
+
+                if (
+                    capture_when_centered
+                    and saved_raw_capture_path is None
+                    and centered_frame_count >= CENTERED_FRAMES_REQUIRED
+                ):
+                    saved_raw_capture_path = save_raw_capture(clean_frame, raw_captures_dir)
+                    print(f"Saved centered raw capture: {saved_raw_capture_path}")
+                    state = CameraState.DONE
                     return True
+
+                if preview:
+                    draw_face_tracking_overlay(
+                        frame,
+                        state_label=state.name,
+                        face_box=face_box,
+                        error_x_px=error_x_px,
+                        error_y_px=error_y_px,
+                        joint_step_deg=joint_step_deg,
+                    )
+
+                    cv2.imshow(PREVIEW_WINDOW, frame)
+                    key = cv2.waitKey(1) & 0xFF
+
+                    if key in (27, ord("q")):
+                        print("Face tracking stopped by user.")
+                        state = CameraState.DONE
+                        return True
+
+            elif state == CameraState.DONE:
+                return True
 
     except KeyboardInterrupt:
         print("Keyboard interrupt. Exiting.")
@@ -515,7 +819,10 @@ def move_to_camera_init(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Open the camera stream and move the robot to CAMERA_INIT in two phases."
+        description=(
+            "Open the camera stream, move the robot to CAMERA_INIT, rotate the last joint, "
+            "then track the closest detected face."
+        )
     )
     parser.add_argument(
         "--camera-index",
@@ -583,6 +890,21 @@ def parse_args() -> argparse.Namespace:
             f"(default: {JOINT_CONTROLLER_SETTLE_S})."
         ),
     )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help=(
+            "Do not save a raw capture when the face becomes centered. "
+            "By default, once the face stays inside the deadband for "
+            f"{CENTERED_FRAMES_REQUIRED} consecutive frames a JPEG is saved to "
+            f"{DEFAULT_RAW_CAPTURES_DIR} and the script exits."
+        ),
+    )
+    parser.add_argument(
+        "--raw-captures-dir",
+        default=str(DEFAULT_RAW_CAPTURES_DIR),
+        help=f"Directory for the centered raw JPEG capture (default: {DEFAULT_RAW_CAPTURES_DIR}).",
+    )
     return parser.parse_args()
 
 
@@ -605,6 +927,8 @@ def main() -> None:
         joint_arrival_threshold=args.joint_arrival_threshold,
         joint_max_step_deg=args.joint_max_step_deg,
         joint_controller_settle_s=args.joint_controller_settle_s,
+        capture_when_centered=not args.no_capture,
+        raw_captures_dir=args.raw_captures_dir,
     )
     if ok is False:
         sys.exit(1)

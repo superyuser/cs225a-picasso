@@ -40,6 +40,28 @@ MIN_FILL_CONTOUR_AREA = 40
 MIN_FILL_CONTOUR_LENGTH = 20
 FILL_SIMPLIFY_EPS_FRAC = 0.004
 
+# ------------------------------------------------------------
+# Corner filleting / smoothing
+#
+# After simplification, each polyline can still have sharp inflection
+# corners. We round these using Chaikin-style corner cutting: at every
+# vertex sharper than the threshold, replace the point with two new
+# points placed FILLET_RATIO of the way back along each adjacent edge.
+# Multiple iterations progressively smooth remaining sharp corners.
+#
+# Interior angle convention:
+#   180 deg = perfectly straight (no turn)
+#    90 deg = right-angle corner
+#     0 deg = full reversal
+# Smaller angle = sharper corner.
+#
+# Set FILLET_ANGLE_THRESHOLD_DEG = 180 to smooth every corner (pure Chaikin).
+# Use FILLET_ITERATIONS = 0 to disable smoothing entirely.
+# ------------------------------------------------------------
+FILLET_ANGLE_THRESHOLD_DEG = 150.0
+FILLET_RATIO = 0.25
+FILLET_ITERATIONS = 2
+
 # Randomization
 RANDOM_SEED = 42
 SHUFFLE_FILL_STROKES = True
@@ -199,6 +221,86 @@ def mm_to_px(mm, image_w, canvas_w_mm):
 
 
 # ============================================================
+# CORNER FILLETING / CHAIKIN SMOOTHING
+# ============================================================
+
+def fillet_polyline(
+    points,
+    *,
+    angle_threshold_deg=None,
+    fillet_ratio=None,
+    iterations=None,
+    closed: bool = True,
+):
+    """Round sharp corners in a polyline using selective corner-cutting.
+
+    For each interior vertex, computes the interior angle between the
+    incoming and outgoing edges. If the angle is sharper than
+    ``angle_threshold_deg`` (i.e. the corner turns more than the threshold
+    allows), the vertex is replaced with two new points placed at
+    ``fillet_ratio`` along each adjacent edge. Vertices on gentler bends
+    are left in place.
+
+    ``None`` parameters fall back to the module-level ``FILLET_*`` globals
+    so that CLI overrides in ``main()`` take effect.
+
+    Accepts arrays of shape ``(N, 2)`` or OpenCV's ``(N, 1, 2)``.
+    Returns a float array of shape ``(M, 2)``.
+    """
+    if angle_threshold_deg is None:
+        angle_threshold_deg = FILLET_ANGLE_THRESHOLD_DEG
+    if fillet_ratio is None:
+        fillet_ratio = FILLET_RATIO
+    if iterations is None:
+        iterations = FILLET_ITERATIONS
+
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim == 3 and pts.shape[1] == 1:
+        pts = pts[:, 0, :]
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3 or iterations <= 0:
+        return pts
+
+    for _ in range(iterations):
+        n = len(pts)
+        if n < 3:
+            break
+
+        new_pts = []
+        for i in range(n):
+            if not closed and (i == 0 or i == n - 1):
+                new_pts.append(pts[i])
+                continue
+
+            p_prev = pts[(i - 1) % n]
+            p_curr = pts[i]
+            p_next = pts[(i + 1) % n]
+
+            v1 = p_prev - p_curr
+            v2 = p_next - p_curr
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 < 1e-9 or n2 < 1e-9:
+                new_pts.append(p_curr)
+                continue
+
+            cos_a = float(np.dot(v1, v2) / (n1 * n2))
+            cos_a = max(-1.0, min(1.0, cos_a))
+            angle_deg = math.degrees(math.acos(cos_a))  # 0..180
+
+            if angle_deg < angle_threshold_deg:
+                q = p_curr + fillet_ratio * (p_prev - p_curr)
+                r = p_curr + fillet_ratio * (p_next - p_curr)
+                new_pts.append(q)
+                new_pts.append(r)
+            else:
+                new_pts.append(p_curr)
+
+        pts = np.asarray(new_pts, dtype=np.float64)
+
+    return pts
+
+
+# ============================================================
 # LINE ART EXTRACTION
 # ============================================================
 
@@ -243,9 +345,14 @@ def contours_to_outline_strokes(line_mask, canvas_w_mm, canvas_h_mm):
         if len(pts_px) < 3:
             continue
 
+        filleted = fillet_polyline(pts_px, closed=True)
+        pts_px_int = filleted.round().astype(int)
+        if len(pts_px_int) < 3:
+            continue
+
         pts_mm = [
             px_to_mm(int(x), int(y), w, h, canvas_w_mm, canvas_h_mm)
-            for x, y in pts_px
+            for x, y in pts_px_int
         ]
 
         strokes.append({
@@ -253,7 +360,7 @@ def contours_to_outline_strokes(line_mask, canvas_w_mm, canvas_h_mm):
             "layer": "outline_black",
             "closed": True,
             "brush_width_mm": OUTLINE_BRUSH_WIDTH_MM,
-            "points_px": pts_px.astype(int).tolist(),
+            "points_px": pts_px_int.tolist(),
             "points_mm": pts_mm,
         })
 
@@ -477,8 +584,13 @@ def generate_onion_fill_strokes(mask, region_name, canvas_w_mm, canvas_h_mm, bru
             if len(smooth) < 3:
                 continue
 
+            filleted = fillet_polyline(smooth, closed=True)
+            if len(filleted) < 3:
+                continue
+            smooth_filleted = filleted.round().astype(np.int32).reshape(-1, 1, 2)
+
             stroke = contour_to_stroke(
-                smooth,
+                smooth_filleted,
                 region_name,
                 brush_width_mm,
                 canvas_w_mm,
@@ -607,6 +719,8 @@ def render_stroke_preview(
 # ============================================================
 
 def main():
+    global FILLET_ANGLE_THRESHOLD_DEG, FILLET_RATIO, FILLET_ITERATIONS
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=str, help="Input line-art image")
     parser.add_argument(
@@ -631,7 +745,44 @@ def main():
     parser.add_argument("--canvas_w_mm", default=CANVAS_WIDTH_MM, type=float)
     parser.add_argument("--canvas_h_mm", default=CANVAS_HEIGHT_MM, type=float)
     parser.add_argument("--seed", default=RANDOM_SEED, type=int)
+    parser.add_argument(
+        "--fillet-angle-deg",
+        type=float,
+        default=FILLET_ANGLE_THRESHOLD_DEG,
+        help=(
+            "Interior-angle threshold for corner filleting (deg). 180=smooth every "
+            "corner (pure Chaikin); lower values only round sharper corners. "
+            f"Default: {FILLET_ANGLE_THRESHOLD_DEG}."
+        ),
+    )
+    parser.add_argument(
+        "--fillet-ratio",
+        type=float,
+        default=FILLET_RATIO,
+        help=(
+            "How far back along each adjacent edge the corner cut is placed "
+            "(0..0.5). Larger = more aggressive rounding. "
+            f"Default: {FILLET_RATIO}."
+        ),
+    )
+    parser.add_argument(
+        "--fillet-iterations",
+        type=int,
+        default=FILLET_ITERATIONS,
+        help=(
+            "Number of smoothing passes. 0 disables filleting entirely. "
+            f"Default: {FILLET_ITERATIONS}."
+        ),
+    )
     args = parser.parse_args()
+
+    FILLET_ANGLE_THRESHOLD_DEG = float(args.fillet_angle_deg)
+    FILLET_RATIO = float(args.fillet_ratio)
+    FILLET_ITERATIONS = int(args.fillet_iterations)
+    print(
+        f"Corner filleting: angle_threshold={FILLET_ANGLE_THRESHOLD_DEG} deg, "
+        f"ratio={FILLET_RATIO}, iterations={FILLET_ITERATIONS}"
+    )
 
     random.seed(args.seed)
     np.random.seed(args.seed)

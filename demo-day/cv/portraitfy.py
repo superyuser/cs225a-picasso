@@ -1,6 +1,7 @@
 import argparse
 import base64
 import os
+import time
 from pathlib import Path
 
 from openai import OpenAI
@@ -9,6 +10,10 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = None
+
+
+def _log(msg: str) -> None:
+    print(f"[portraitfy] {msg}", flush=True)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -26,14 +31,18 @@ def _load_env() -> None:
     the caller is expected to have ``OPENAI_API_KEY`` exported in the shell.
     """
     if load_dotenv is None:
+        _log("python-dotenv not installed; relying on shell-exported env vars.")
         return
     if DOTENV_PATH.is_file():
+        _log(f"loading .env from {DOTENV_PATH}")
         load_dotenv(DOTENV_PATH)
     else:
+        _log(f".env not found at {DOTENV_PATH}; using cwd fallback.")
         load_dotenv()
 
 
 _load_env()
+_log(f"OPENAI_API_KEY present: {bool(os.getenv('OPENAI_API_KEY'))}")
 
 
 LINE_ART_PROMPT = """
@@ -107,15 +116,23 @@ def save_image_from_response(result, output_path: str):
     """
     if not result.data:
         raise RuntimeError("Image API returned no data.")
+    _log(f"response data entries: {len(result.data)}")
 
     image_b64 = result.data[0].b64_json
     if image_b64 is None:
         raise RuntimeError("Image API response did not include b64_json.")
+    _log(f"b64 string length: {len(image_b64)} chars")
 
+    decode_start = time.perf_counter()
     image_bytes = decode_b64_image(image_b64)
+    _log(
+        f"decoded {len(image_bytes) / 1024.0:.1f} KB in "
+        f"{(time.perf_counter() - decode_start) * 1000:.1f} ms"
+    )
 
     with open(output_path, "wb") as f:
         f.write(image_bytes)
+    _log(f"wrote {output_path}")
 
 
 def cartoonize_to_line_art(
@@ -127,12 +144,16 @@ def cartoonize_to_line_art(
     """
     Converts an input portrait into cute, simplified black-and-white line art.
     """
+    pipeline_start = time.perf_counter()
+
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError(
             "OPENAI_API_KEY is not set. Put it in "
             f"{DOTENV_PATH} or export it in your shell. "
             "If dotenv isn't installed, run `pip install python-dotenv`."
         )
+
+    _log("initializing OpenAI client")
     client = OpenAI()
 
     input_path = str(input_path)
@@ -141,17 +162,31 @@ def cartoonize_to_line_art(
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input image not found: {input_path}")
 
+    in_size_kb = os.path.getsize(input_path) / 1024.0
+    _log(f"input:  {input_path} ({in_size_kb:.1f} KB)")
+    _log(f"output: {output_path}")
+    _log(f"model={model}  size={size}")
+    _log(f"prompt length: {len(LINE_ART_PROMPT)} chars")
+
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     with open(input_path, "rb") as image_file:
+        _log("calling OpenAI images.edit ...")
+        api_start = time.perf_counter()
         result = client.images.edit(
             model=model,
             image=image_file,
             prompt=LINE_ART_PROMPT,
             size=size,
         )
+        api_elapsed = time.perf_counter() - api_start
+        _log(f"API responded in {api_elapsed:.2f}s")
 
     save_image_from_response(result, output_path)
+
+    out_size_kb = os.path.getsize(output_path) / 1024.0
+    total_elapsed = time.perf_counter() - pipeline_start
+    _log(f"saved {out_size_kb:.1f} KB; total elapsed {total_elapsed:.2f}s")
 
     print("Done.")
     print(f"Input:  {input_path}")
@@ -189,11 +224,13 @@ def main():
     )
 
     args = parser.parse_args()
+    _log(f"args: input={args.input}  output={args.output}  model={args.model}  size={args.size}")
 
     output_path = args.output
     if output_path is None:
         input_stem = Path(args.input).stem
         output_path = DEFAULT_OUTPUT_DIR / f"{input_stem}_cartoon.png"
+        _log(f"output not specified; defaulting to {output_path}")
 
     cartoonize_to_line_art(
         input_path=args.input,
