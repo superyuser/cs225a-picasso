@@ -4,6 +4,7 @@ Flow:
     INIT_POS (Cartesian) -> TOOL_SAFE_APPROACH -> TOOL_SAFE_APPROACH_2 -> TOOL_INIT
     then Cartesian paint dips:
         P1_INIT_POS -> dip -> P2_INIT_POS -> dip -> P3_INIT_POS -> dip
+        -> WATER_INIT_POS -> swirl water -> WATER_TO_NAPKIN_INIT_POS -> wipe napkin
 
 Each dip is hover -> hover + z_dive_in_offset -> hover (see helpers/primitives.py).
 
@@ -39,12 +40,15 @@ try:
 except ImportError:
     redis = None
 
+from helpers.joint_motion import approach_tool_init
 from helpers.primitives import (
     dip_paint_1,
     dip_paint_2,
     dip_paint_3,
     load_paint_init_pos_m,
     load_z_dive_in_offset_m,
+    swirl_water,
+    wipe_napkin,
 )
 
 
@@ -1319,6 +1323,67 @@ def run_paint_dip_sequence(
         ):
             return False
 
+    water_pos = load_paint_init_pos_m(cfg, "WATER_INIT_POS")
+    if not move_cartesian_to_target(
+        redis_client,
+        target_position=water_pos,
+        hold_orientation=hold_orientation,
+        label="WATER_INIT_POS",
+        pos_tol_m=pos_tol_m,
+        status_period_s=status_period_s,
+        timeout_s=timeout_s,
+        start_time=sequence_start,
+        path_trace=path_trace,
+        trace_start=trace_start,
+    ):
+        return False
+
+    print("Reached WATER_INIT_POS.")
+    if hover_dwell_s > 0.0:
+        time.sleep(hover_dwell_s)
+
+    if not swirl_water(
+        redis_client,
+        hold_orientation=hold_orientation,
+        config=cfg,
+        dwell_at_dip_s=dip_dwell_s,
+        dwell_at_hover_s=hover_dwell_s,
+        timeout_s=timeout_s,
+        status_period_s=status_period_s,
+        move_fn=move_fn,
+    ):
+        return False
+
+    napkin_approach_pos = load_paint_init_pos_m(cfg, "WATER_TO_NAPKIN_INIT_POS")
+    if not move_cartesian_to_target(
+        redis_client,
+        target_position=napkin_approach_pos,
+        hold_orientation=hold_orientation,
+        label="WATER_TO_NAPKIN_INIT_POS",
+        pos_tol_m=pos_tol_m,
+        status_period_s=status_period_s,
+        timeout_s=timeout_s,
+        start_time=sequence_start,
+        path_trace=path_trace,
+        trace_start=trace_start,
+    ):
+        return False
+
+    print("Reached WATER_TO_NAPKIN_INIT_POS.")
+    if hover_dwell_s > 0.0:
+        time.sleep(hover_dwell_s)
+
+    if not wipe_napkin(
+        redis_client,
+        hold_orientation=hold_orientation,
+        config=cfg,
+        dwell_s=hover_dwell_s,
+        timeout_s=timeout_s,
+        status_period_s=status_period_s,
+        move_fn=move_fn,
+    ):
+        return False
+
     print("\nFinished paint-station dip sequence.")
     return True
 
@@ -1334,6 +1399,8 @@ def move_to_tool_init(
     timeout_s: float = TIMEOUT_S,
     save_path_plot: bool = True,
     path_log_dir: Path = DEFAULT_PATH_LOG_DIR,
+    use_cached_tool_init_path: bool = True,
+    rebuild_tool_init_path: bool = False,
 ) -> int:
     path_trace: list[PathTraceSample] = []
     trace_start = time.perf_counter()
@@ -1347,178 +1414,33 @@ def move_to_tool_init(
         print("`redis` package is not installed.")
         return finish(1)
 
-    tool_waypoints_deg = load_tool_waypoints_deg()
-    tool_waypoint_names = [name for name, _waypoint in tool_waypoints_deg]
-    tool_waypoints = [
-        waypoint_deg * DEG_TO_RAD
-        for _name, waypoint_deg in tool_waypoints_deg
-    ]
-    joint_goal = tool_waypoints[-1]
-
     redis_client = redis.Redis()
     if not ensure_robot_ready(redis_client, config_file_name_expected):
         return finish(1)
 
-    init_result = move_to_init_pos(
+    approach = approach_tool_init(
+        redis_client,
+        joint_arrival_threshold=joint_arrival_threshold,
+        joint_max_step_deg=joint_max_step_deg,
+        joint_controller_settle_s=joint_controller_settle_s,
+        dwell_at_tool_init_s=dwell_s,
+        status_period_s=status_period_s,
+        timeout_s=timeout_s,
+        use_cached_path=use_cached_tool_init_path,
+        rebuild_path=rebuild_tool_init_path,
+    )
+    if approach is None:
+        return finish(1)
+
+    if not run_paint_dip_sequence(
         redis_client,
         status_period_s=status_period_s,
         timeout_s=timeout_s,
         path_trace=path_trace,
         trace_start=trace_start,
-    )
-    if init_result != 0:
-        return finish(init_result)
-
-    current_joint_position = read_np(
-        redis_client,
-        redis_keys.sensor_joint_positions,
-        (7,),
-    )
-    commanded_joint_position = current_joint_position.copy()
-
-    joint_names = read_optional_json(redis_client, redis_keys.joint_names)
-    if joint_names is not None:
-        print("Joint names:", joint_names)
-
-    max_joint_step = max(abs(joint_max_step_deg) * DEG_TO_RAD, 1.0e-5)
-    path, waypoint_indices = build_smooth_joint_path(
-        [
-            current_joint_position,
-            *tool_waypoints,
-        ],
-        max_step=max_joint_step,
-    )
-    command_waypoint_indices = {
-        waypoint_index: waypoint_name
-        for waypoint_index, waypoint_name in zip(
-            waypoint_indices[1:],
-            tool_waypoint_names,
-        )
-    }
-
-    print(
-        "Current joint position (deg):",
-        np.round(current_joint_position / DEG_TO_RAD, 3),
-    )
-    for name, waypoint_deg in tool_waypoints_deg:
-        print(f"{name} target (deg):", np.round(waypoint_deg, 3))
-    print(
-        "Commanded joint delta (deg):",
-        np.round((joint_goal - current_joint_position) / DEG_TO_RAD, 3),
-    )
-    print("Joint max step (deg):", joint_max_step_deg)
-    print("Smooth joint path samples:", len(path))
-    for waypoint_index, waypoint_name in command_waypoint_indices.items():
-        print(f"{waypoint_name} command sample:", waypoint_index + 1)
-
-    set_joint_goal(redis_client, current_joint_position)
-    set_active_controller(redis_client, JOINT_CONTROLLER)
-    print("Using controller:", JOINT_CONTROLLER)
-
-    settle_start = time.perf_counter()
-    while time.perf_counter() - settle_start < joint_controller_settle_s:
-        set_joint_goal(redis_client, current_joint_position)
-        time.sleep(DT)
-
-    loop_time = 0.0
-    last_status = 0.0
-    start = time.perf_counter()
-    time.sleep(0.01)
-    init_time = time.perf_counter_ns() * 1e-9
-    path_index = 1
-
-    while path_index < len(path):
-        loop_time += DT
-        time.sleep(
-            max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
-        )
-
-        commanded_joint_position = path[path_index]
-        current_joint_position = read_np(
-            redis_client,
-            redis_keys.sensor_joint_positions,
-            (7,),
-        )
-        append_path_trace(
-            path_trace,
-            trace_start=trace_start,
-            phase="TOOL_JOINT_PATH",
-            position=read_optional_np(
-                redis_client,
-                redis_keys.cartesian_task_current_position,
-                (3,),
-            ),
-        )
-
-        joint_error = float(np.linalg.norm(joint_goal - current_joint_position))
-        commanded_error = float(np.linalg.norm(joint_goal - commanded_joint_position))
-        set_joint_goal(redis_client, commanded_joint_position)
-
-        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
-            path_label = command_waypoint_indices.get(
-                path_index,
-                f"path_sample {path_index + 1}/{len(path)}",
-            )
-            if path_index in command_waypoint_indices:
-                path_label = f"passing {path_label}"
-            print(
-                "FOLLOWING_TOOL_PATH",
-                "|",
-                path_label,
-                "| joint_error:",
-                round(joint_error, 5),
-                "| commanded_remaining:",
-                round(commanded_error, 5),
-            )
-            last_status = loop_time
-
-        if timeout_s > 0.0 and time.perf_counter() - start > timeout_s:
-            print("Timed out while streaming the tool-station joint path.")
-            print("Final joint error:", round(joint_error, 5))
-            return finish(1)
-
-        path_index += 1
-
-    set_joint_goal(redis_client, joint_goal)
-    while True:
-        current_joint_position = read_np(
-            redis_client,
-            redis_keys.sensor_joint_positions,
-            (7,),
-        )
-        append_path_trace(
-            path_trace,
-            trace_start=trace_start,
-            phase="TOOL_SETTLE",
-            position=read_optional_np(
-                redis_client,
-                redis_keys.cartesian_task_current_position,
-                (3,),
-            ),
-        )
-        joint_error = float(np.linalg.norm(joint_goal - current_joint_position))
-        if joint_error < joint_arrival_threshold:
-            print("Reached TOOL_INIT.")
-            if dwell_s > 0.0:
-                time.sleep(dwell_s)
-
-            if not run_paint_dip_sequence(
-                redis_client,
-                status_period_s=status_period_s,
-                timeout_s=timeout_s,
-                path_trace=path_trace,
-                trace_start=trace_start,
-            ):
-                return finish(1)
-            return finish(0)
-
-        if timeout_s > 0.0 and time.perf_counter() - start > timeout_s:
-            print("Timed out before settling at TOOL_INIT.")
-            print("Final joint error:", round(joint_error, 5))
-            return finish(1)
-
-        set_joint_goal(redis_client, joint_goal)
-        time.sleep(DT)
+    ):
+        return finish(1)
+    return finish(0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1580,6 +1502,19 @@ def parse_args() -> argparse.Namespace:
         default=TIMEOUT_S,
         help=f"Maximum seconds to wait for arrival. Use 0 to disable (default: {TIMEOUT_S}).",
     )
+    parser.add_argument(
+        "--rebuild-tool-init-path",
+        action="store_true",
+        help=(
+            "Rebuild and save demo-day/tool_init_joint_path.json instead of "
+            "using the cached joint path."
+        ),
+    )
+    parser.add_argument(
+        "--no-cached-tool-init-path",
+        action="store_true",
+        help="Do not load the cached INIT_POS -> TOOL_INIT joint path JSON.",
+    )
     return parser.parse_args()
 
 
@@ -1596,6 +1531,8 @@ def main() -> int:
             timeout_s=args.timeout_s,
             save_path_plot=not args.no_path_plot,
             path_log_dir=Path(args.path_log_dir),
+            use_cached_tool_init_path=not args.no_cached_tool_init_path,
+            rebuild_tool_init_path=args.rebuild_tool_init_path,
         )
     except RuntimeError as exc:
         print("Could not start tool-station run:")
