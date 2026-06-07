@@ -45,7 +45,7 @@ DT = 0.01
 POS_TOL_M = 1.0e-2
 DWELL_AFTER_TRANSLATION_S = 0.25
 ARC_STEP_M = 0.02
-ARC_SAGITTA_M = 0.12
+ARC_SAGITTA_M = 0.25
 # Minimum XY arc radius enforced when constructing translation paths. Short
 # chord segments would otherwise produce a small radius (sharp curvature)
 # which makes the cartesian controller shake during execution. If the radius
