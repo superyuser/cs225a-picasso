@@ -5,8 +5,12 @@ waypoints. The robot first moves to INIT_POS with the Cartesian controller
 while holding its current orientation. Then the OpenSai joint controller is
 fed one smooth joint-space trajectory through TOOL_SAFE_APPROACH,
 TOOL_SAFE_APPROACH_2, and TOOL_INIT. The wrist camera opens before robot
-motion starts and scans for tag36h11 AprilTags with IDs 10, 11, 12, and 13
-after arrival.
+motion starts.
+
+As soon as TOOL_INIT is reached (within joint arrival tolerance), the script
+writes demo-day/tool_station_model.json and demo-day/tool_station_observation.json
+using whichever tool tag is visible as the reference (prefer id 10). A
+follow-up camera scan optionally verifies that all four tags are visible.
 
 Usage:
     python robot/visit_tool_station.py
@@ -841,10 +845,12 @@ def estimate_tool_tag_pose(
 class ToolTagObservationSnapshot:
     """Tag poses and EE pose captured on the same camera frames."""
 
+    reference_tag_id: int
     tag_poses_in_camera_frame: dict[int, dict[str, list[float]]]
     ee_position_world_m: np.ndarray
     ee_orientation_world: np.ndarray
     num_frames: int
+    visible_tag_ids: list[int]
 
 
 def capture_tool_tag_observation(
@@ -855,17 +861,21 @@ def capture_tool_tag_observation(
     intrinsics_json: Path,
     num_frames: int,
 ) -> ToolTagObservationSnapshot | None:
-    """Capture a short snapshot averaging tag PnP poses and EE Cartesian pose.
+    """Capture tag PnP poses and EE Cartesian pose on synchronized frames.
 
-    For each frame where all four tool tags are visible, the current Cartesian
-    position and orientation are read from Redis and stored alongside the tag
-    poses. The returned EE pose is the average over those synchronized frames
-    (not the nominal TOOL_INIT joint target, which may differ due to joint
-    tracking error).
+    Only the reference tag must be visible in every collected frame. The
+    reference tag is the first detected tag in preference order
+    (10, 11, 12, 13). Other visible tool tags are recorded when present.
     """
     if cv2 is None:
         raise RuntimeError("`cv2` package is not installed.")
 
+    try:
+        from model_tool_station import pick_reference_tag_id
+    except ImportError as exc:
+        raise RuntimeError("Could not import model_tool_station") from exc
+
+    reference_tag_id: int | None = None
     tvec_history: dict[int, list[np.ndarray]] = {tid: [] for tid in TOOL_TAG_IDS}
     rvec_history: dict[int, list[np.ndarray]] = {tid: [] for tid in TOOL_TAG_IDS}
     ee_pos_history: list[np.ndarray] = []
@@ -875,7 +885,9 @@ def capture_tool_tag_observation(
 
     frames_collected = 0
     attempts = 0
-    while frames_collected < num_frames and attempts < num_frames * 4:
+    max_attempts = max(num_frames * 8, 40)
+
+    while frames_collected < num_frames and attempts < max_attempts:
         attempts += 1
         ok, frame = cap.read()
         if not ok:
@@ -902,7 +914,22 @@ def capture_tool_tag_observation(
             per_frame_tvecs[tag_id] = tvec
             per_frame_rvecs[tag_id] = rvec
 
-        if not all(tid in per_frame_tvecs for tid in TOOL_TAG_IDS):
+        visible_tool_ids = set(per_frame_tvecs.keys())
+        if not visible_tool_ids:
+            continue
+
+        if reference_tag_id is None:
+            reference_tag_id = pick_reference_tag_id(visible_tool_ids)
+            if reference_tag_id is None:
+                continue
+            print(
+                "Selected reference tag for tool-station calibration:",
+                reference_tag_id,
+                "| visible:",
+                sorted(visible_tool_ids),
+            )
+
+        if reference_tag_id not in per_frame_tvecs:
             continue
 
         ee_pos = read_np(
@@ -916,22 +943,25 @@ def capture_tool_tag_observation(
             (3, 3),
         )
 
-        for tag_id in TOOL_TAG_IDS:
+        for tag_id in visible_tool_ids:
             tvec_history[tag_id].append(per_frame_tvecs[tag_id])
             rvec_history[tag_id].append(per_frame_rvecs[tag_id])
         ee_pos_history.append(ee_pos)
         ee_ori_history.append(ee_ori)
         frames_collected += 1
 
-    if frames_collected == 0:
+    if frames_collected == 0 or reference_tag_id is None:
         print(
-            "Tool-station snapshot failed: could not collect a single frame"
-            " with all tool tags visible."
+            "Tool-station snapshot failed: no frame with a usable tool tag"
+            f" after {attempts} attempts."
         )
         return None
 
     poses: dict[int, dict[str, list[float]]] = {}
-    for tag_id in TOOL_TAG_IDS:
+    visible_tag_ids = sorted(
+        tag_id for tag_id in TOOL_TAG_IDS if tvec_history[tag_id]
+    )
+    for tag_id in visible_tag_ids:
         tvecs = np.array(tvec_history[tag_id], dtype=float)
         rvecs = np.array(rvec_history[tag_id], dtype=float)
         poses[tag_id] = {
@@ -945,17 +975,20 @@ def capture_tool_tag_observation(
 
     print(
         f"Captured tool-station snapshot: averaged {frames_collected} frames"
-        " with all 4 tool tags visible."
+        f" with reference tag {reference_tag_id} visible."
     )
+    print("Visible tool tags in snapshot:", visible_tag_ids)
     print(
         "Synchronized EE Cartesian pose at tag scan (world frame):",
         np.round(ee_pos_mean, 5).tolist(),
     )
     return ToolTagObservationSnapshot(
+        reference_tag_id=reference_tag_id,
         tag_poses_in_camera_frame=poses,
         ee_position_world_m=ee_pos_mean,
         ee_orientation_world=ee_ori_mean,
         num_frames=frames_collected,
+        visible_tag_ids=visible_tag_ids,
     )
 
 
@@ -969,11 +1002,11 @@ def save_tool_station_artifacts(
     observation_json_path: Path,
     snapshot_frames: int,
 ) -> int:
-    """Save the station model + a runtime snapshot (tag poses + EE pose).
+    """Save tool-station JSON files as soon as TOOL_INIT is reached.
 
-    Called after `scan_tool_tags()` returns successfully and the robot is at
-    TOOL_INIT. Minimises changes to the existing trajectory: no robot motion,
-    no controller switches. Returns 0 on success, 1 on failure.
+    Always writes the static model JSON first. Then snapshots whatever tool
+    tags are visible (reference tag required) together with the Redis
+    Cartesian pose and writes the observation JSON.
     """
     try:
         from model_tool_station import PaintToolStationModel
@@ -994,8 +1027,8 @@ def save_tool_station_artifacts(
     )
     if snapshot is None:
         print(
-            "Skipping observation JSON: snapshot could not collect a frame"
-            " with all four tool tags visible."
+            "Observation JSON was NOT written: no usable tool tag was visible"
+            " at TOOL_INIT. Model JSON was still saved."
         )
         return 1
 
@@ -1005,13 +1038,14 @@ def save_tool_station_artifacts(
         "tag_family": TAG_FAMILY,
         "tag_size_m": TAG_SIZE_M,
         "tool_tag_ids": list(TOOL_TAG_IDS),
-        "reference_tag_id": model.reference_tag_id,
+        "reference_tag_id": snapshot.reference_tag_id,
+        "visible_tag_ids": snapshot.visible_tag_ids,
         "snapshot_num_frames": snapshot.num_frames,
         "note": (
             "ee_position_world_m and ee_orientation_world are the Redis "
             "Cartesian pose averaged over the same frames as the tag scan. "
-            "This is the actual measured pose at tag observation time, not "
-            "the nominal TOOL_INIT joint target."
+            "reference_tag_id is the detected tag used to anchor the station "
+            "frame (prefer 10, else first visible in 10/11/12/13 order)."
         ),
         "ee_position_world_m": [float(v) for v in snapshot.ee_position_world_m],
         "ee_orientation_world": [
@@ -1034,6 +1068,7 @@ def save_tool_station_artifacts(
     with observation_json_path.open("w", encoding="utf-8") as f:
         json.dump(observation_payload, f, indent=2)
     print(f"Saved tool-station observation JSON: {observation_json_path}")
+    print(f"Reference tag id: {snapshot.reference_tag_id}")
     return 0
 
 
@@ -1383,6 +1418,26 @@ def main() -> int:
         if move_result != 0:
             return move_result
 
+        print("TOOL_INIT reached. Writing tool-station JSON immediately.")
+        if redis is None:
+            print(
+                "`redis` package is not installed; cannot save observation JSON."
+            )
+            return 1
+
+        redis_client = redis.Redis()
+        artifact_result = save_tool_station_artifacts(
+            cap=cap,
+            detector_bundle=detector_bundle,
+            redis_client=redis_client,
+            intrinsics_json=Path(args.intrinsics_json),
+            model_json_path=Path(args.tool_station_model_json),
+            observation_json_path=Path(args.tool_station_observation_json),
+            snapshot_frames=args.tool_observation_frames,
+        )
+        if artifact_result != 0:
+            return artifact_result
+
         scan_result = scan_tool_tags(
             cap=cap,
             detector_bundle=detector_bundle,
@@ -1392,25 +1447,10 @@ def main() -> int:
             timeout_s=args.scan_timeout_s,
         )
         if scan_result != 0:
-            return scan_result
-
-        # Export model + runtime snapshot for demo-day/robot/visit_tool_volumes.py.
-        if redis is None:
             print(
-                "`redis` package is not installed; skipping tool-station"
-                " observation JSON export."
+                "WARNING: post-calibration scan did not confirm all tool tags,"
+                " but tool-station JSON was already written."
             )
-            return 0
-        redis_client = redis.Redis()
-        save_tool_station_artifacts(
-            cap=cap,
-            detector_bundle=detector_bundle,
-            redis_client=redis_client,
-            intrinsics_json=Path(args.intrinsics_json),
-            model_json_path=Path(args.tool_station_model_json),
-            observation_json_path=Path(args.tool_station_observation_json),
-            snapshot_frames=args.tool_observation_frames,
-        )
         return 0
 
     except RuntimeError as exc:

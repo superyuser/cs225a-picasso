@@ -49,6 +49,7 @@ from model_tool_station import (  # type: ignore[import-not-found]
     INIT_VISIT_ORDER,
     PaintToolStationModel,
     VOLUME_NAME_TO_INIT_LABEL,
+    station_point_in_reference_tag_local_m,
 )
 
 
@@ -163,43 +164,29 @@ def position_error(current_pos, goal_pos) -> float:
 # WORLD-FRAME MATH
 # ============================================================
 
-# Rotation/offset of the station frame relative to tag-10's local PnP frame.
-# Derivation: the model places tag 10's top-left corner at the station origin,
-# with station X pointing along the tag-row in the direction of decreasing
-# tag id and station Y running "down" the tag face toward the containers.
-#
-# Tag-local frame (from OpenCV's solvePnP square corners):
-#     +x: right, +y: up, +z: out of the tag face.
-#
-# Mapping a vector from station to tag-10-local: station +X is tag-10 -X,
-# station +Y is tag-10 -Y, station +Z aligns with tag-10 +Z. So
-#     R_STATION_TO_TAG10_LOCAL = diag(-1, -1, +1).
-# Position offset (station origin expressed in tag-10-local coords) is
-# tag 10's TL corner in tag-10-local coords: (-s, +s, 0) with s = tag_size/2.
-R_STATION_TO_TAG10_LOCAL = np.diag([-1.0, -1.0, 1.0])
-
-
-def station_origin_in_tag10_local_m(tag_size_m: float) -> np.ndarray:
-    s = tag_size_m / 2.0
-    return np.array([-s, s, 0.0], dtype=float)
+# Rotation mapping station-frame vectors into a tag's local PnP frame.
+# See model_tool_station.py for the derivation.
+R_STATION_TO_TAG_LOCAL = np.diag([-1.0, -1.0, 1.0])
 
 
 def station_point_in_camera_frame_m(
     p_station_m: np.ndarray,
     *,
-    tag10_tvec_cam: np.ndarray,
-    tag10_rvec_cam: np.ndarray,
+    ref_tvec_cam: np.ndarray,
+    ref_rvec_cam: np.ndarray,
     tag_size_m: float,
+    tag_tl_station_m: np.ndarray,
 ) -> np.ndarray:
     """Transform a point from station frame to camera frame (meters)."""
     import cv2  # local import keeps the module importable without OpenCV
 
-    p_in_tag10_local = (
-        R_STATION_TO_TAG10_LOCAL @ np.asarray(p_station_m, dtype=float)
-        + station_origin_in_tag10_local_m(tag_size_m)
+    p_in_tag_local = station_point_in_reference_tag_local_m(
+        p_station_m,
+        tag_size_m=tag_size_m,
+        tag_tl_station_m=tag_tl_station_m,
     )
-    R_tag10_to_cam, _ = cv2.Rodrigues(np.asarray(tag10_rvec_cam, dtype=float))
-    return R_tag10_to_cam @ p_in_tag10_local + np.asarray(tag10_tvec_cam, dtype=float)
+    R_tag_to_cam, _ = cv2.Rodrigues(np.asarray(ref_rvec_cam, dtype=float))
+    return R_tag_to_cam @ p_in_tag_local + np.asarray(ref_tvec_cam, dtype=float)
 
 
 def camera_point_in_world_frame_m(
@@ -241,11 +228,17 @@ def station_point_in_world_frame_m(
     p_station_m: np.ndarray,
     *,
     observation: dict[str, Any],
+    model: PaintToolStationModel,
     tag_size_m: float,
     reference_tag_id: int,
 ) -> np.ndarray:
     poses = observation["tag_poses_in_camera_frame"]
-    ref_pose = poses[str(reference_tag_id)]
+    ref_key = str(reference_tag_id)
+    if ref_key not in poses:
+        raise RuntimeError(
+            f"Observation JSON is missing tag pose for reference tag {reference_tag_id}."
+        )
+    ref_pose = poses[ref_key]
     tvec = np.array(ref_pose["tvec"], dtype=float)
     rvec = np.array(ref_pose["rvec"], dtype=float)
 
@@ -253,12 +246,14 @@ def station_point_in_world_frame_m(
     R_ee = np.array(observation["ee_orientation_world"], dtype=float)
     R_cam_to_tip = np.array(observation["R_camera_to_tip"], dtype=float)
     cam_offset = np.array(observation["camera_offset_in_tip_frame_m"], dtype=float)
+    tag_tl_station_m = model.get_tag_tl_station_m(reference_tag_id)
 
     p_cam = station_point_in_camera_frame_m(
         p_station_m,
-        tag10_tvec_cam=tvec,
-        tag10_rvec_cam=rvec,
+        ref_tvec_cam=tvec,
+        ref_rvec_cam=rvec,
         tag_size_m=tag_size_m,
+        tag_tl_station_m=tag_tl_station_m,
     )
     return camera_point_in_world_frame_m(
         p_cam,
@@ -298,6 +293,7 @@ def build_volume_waypoints(
         p_world = station_point_in_world_frame_m(
             station_point_mm * 1.0e-3,
             observation=observation,
+            model=model,
             tag_size_m=tag_size_m,
             reference_tag_id=reference_tag_id,
         )

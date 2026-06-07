@@ -90,6 +90,41 @@ VOLUME_NAME_TO_INIT_LABEL = {
 INIT_VISIT_ORDER = ("paint_1", "paint_2", "paint_3", "water")
 
 
+R_STATION_TO_TAG_LOCAL = np.diag([-1.0, -1.0, 1.0])
+
+# Preference order when picking which visible tag anchors the station frame.
+REFERENCE_TAG_PREFERENCE = (10, 11, 12, 13)
+
+
+def pick_reference_tag_id(visible_tag_ids: set[int] | list[int]) -> int | None:
+    """Choose the reference tag from whatever is currently visible."""
+    visible = set(int(tid) for tid in visible_tag_ids)
+    for tag_id in REFERENCE_TAG_PREFERENCE:
+        if tag_id in visible:
+            return tag_id
+    return None
+
+
+def station_origin_in_reference_tag_local_m(
+    tag_size_m: float,
+    tag_tl_station_m: np.ndarray,
+) -> np.ndarray:
+    """Station-frame origin expressed in the chosen reference tag's local frame."""
+    s = tag_size_m / 2.0
+    tag_tl_corner = np.array([-s, s, 0.0], dtype=float)
+    return tag_tl_corner + R_STATION_TO_TAG_LOCAL @ (-np.asarray(tag_tl_station_m, dtype=float))
+
+
+def station_point_in_reference_tag_local_m(
+    p_station_m: np.ndarray,
+    *,
+    tag_size_m: float,
+    tag_tl_station_m: np.ndarray,
+) -> np.ndarray:
+    origin = station_origin_in_reference_tag_local_m(tag_size_m, tag_tl_station_m)
+    return origin + R_STATION_TO_TAG_LOCAL @ np.asarray(p_station_m, dtype=float)
+
+
 class PaintToolStationModel:
     def __init__(
         self,
@@ -177,6 +212,11 @@ class PaintToolStationModel:
             )
         )
         return volumes
+
+    def get_tag_tl_station_m(self, tag_id: int) -> np.ndarray:
+        if tag_id not in self.tag_tl_mm:
+            raise KeyError(f"Unknown tag id {tag_id}")
+        return self.tag_tl_mm[tag_id] * MM_TO_M
 
     def get_volume(self, name: str) -> CylinderVolume:
         for volume in self.volumes:
