@@ -2,6 +2,9 @@
 
 Flow:
     INIT_POS (Cartesian) -> TOOL_SAFE_APPROACH -> TOOL_SAFE_APPROACH_2 -> TOOL_INIT
+    then joint-space visits:
+        P1_CENTER -> TOOL_INIT -> P2_CENTER -> TOOL_INIT -> P3_CENTER -> TOOL_INIT
+        -> WATER_CENTER -> TOOL_INIT -> NAPKIN_TOP_POINT -> NAPKIN_BOTTOM_POINT -> TOOL_INIT
 
 Usage:
     python robot/visit_tool_station.py
@@ -51,6 +54,7 @@ JOINT_ARRIVAL_THRESHOLD = 0.25
 JOINT_MAX_STEP_DEG = 0.5
 JOINT_CONTROLLER_SETTLE_S = 0.25
 DWELL_AT_TOOL_INIT_S = 0.5
+DWELL_AT_STATION_POINT_S = 0.5
 STATUS_PERIOD_S = 0.25
 TIMEOUT_S = 60.0
 
@@ -152,6 +156,20 @@ def load_tool_waypoints_deg() -> list[tuple[str, np.ndarray]]:
         (name, load_joint_waypoint_deg(cfg, name))
         for name in waypoint_names
     ]
+
+
+# Station visits after TOOL_INIT: (config key, return_to_tool_init_after).
+STATION_VISIT_SEQUENCE: list[tuple[str, bool]] = [
+    ("P1_CENTER", True),
+    ("P2_CENTER", True),
+    ("P3_CENTER", True),
+    ("WATER_CENTER", True),
+]
+
+NAPKIN_VISIT_SEQUENCE: list[str] = [
+    "NAPKIN_TOP_POINT",
+    "NAPKIN_BOTTOM_POINT",
+]
 
 
 def decode_redis_value(val):
@@ -1063,6 +1081,204 @@ def save_tool_station_artifacts(
     return 0
 
 
+def follow_joint_path_to_goal(
+    redis_client,
+    *,
+    start_joint_position: np.ndarray,
+    goal_joint_position: np.ndarray,
+    label: str,
+    max_joint_step: float,
+    joint_arrival_threshold: float,
+    dwell_s: float = 0.0,
+    status_period_s: float = STATUS_PERIOD_S,
+    timeout_s: float = TIMEOUT_S,
+    path_trace: list[PathTraceSample] | None = None,
+    trace_start: float | None = None,
+    trace_phase: str = "TOOL_JOINT_PATH",
+    settle_phase: str = "TOOL_SETTLE",
+) -> bool:
+    path, _waypoint_indices = build_smooth_joint_path(
+        [start_joint_position, goal_joint_position],
+        max_step=max_joint_step,
+    )
+
+    print(f"Moving to {label}...")
+    print(f"{label} target (deg):", np.round(goal_joint_position / DEG_TO_RAD, 3))
+    print("Smooth joint path samples:", len(path))
+
+    loop_time = 0.0
+    last_status = 0.0
+    start = time.perf_counter()
+    time.sleep(0.01)
+    init_time = time.perf_counter_ns() * 1e-9
+    path_index = 1
+
+    while path_index < len(path):
+        loop_time += DT
+        time.sleep(
+            max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
+        )
+
+        commanded_joint_position = path[path_index]
+        current_joint_position = read_np(
+            redis_client,
+            redis_keys.sensor_joint_positions,
+            (7,),
+        )
+        if path_trace is not None and trace_start is not None:
+            append_path_trace(
+                path_trace,
+                trace_start=trace_start,
+                phase=trace_phase,
+                position=read_optional_np(
+                    redis_client,
+                    redis_keys.cartesian_task_current_position,
+                    (3,),
+                ),
+            )
+
+        joint_error = float(np.linalg.norm(goal_joint_position - current_joint_position))
+        commanded_error = float(
+            np.linalg.norm(goal_joint_position - commanded_joint_position)
+        )
+        set_joint_goal(redis_client, commanded_joint_position)
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                f"FOLLOWING_{label}",
+                "|",
+                f"path_sample {path_index + 1}/{len(path)}",
+                "| joint_error:",
+                round(joint_error, 5),
+                "| commanded_remaining:",
+                round(commanded_error, 5),
+            )
+            last_status = loop_time
+
+        if timeout_s > 0.0 and time.perf_counter() - start > timeout_s:
+            print(f"Timed out while streaming joint path to {label}.")
+            print("Final joint error:", round(joint_error, 5))
+            return False
+
+        path_index += 1
+
+    set_joint_goal(redis_client, goal_joint_position)
+    while True:
+        current_joint_position = read_np(
+            redis_client,
+            redis_keys.sensor_joint_positions,
+            (7,),
+        )
+        if path_trace is not None and trace_start is not None:
+            append_path_trace(
+                path_trace,
+                trace_start=trace_start,
+                phase=settle_phase,
+                position=read_optional_np(
+                    redis_client,
+                    redis_keys.cartesian_task_current_position,
+                    (3,),
+                ),
+            )
+        joint_error = float(np.linalg.norm(goal_joint_position - current_joint_position))
+        if joint_error < joint_arrival_threshold:
+            print(f"Reached {label}.")
+            if dwell_s > 0.0:
+                time.sleep(dwell_s)
+            return True
+
+        if timeout_s > 0.0 and time.perf_counter() - start > timeout_s:
+            print(f"Timed out before settling at {label}.")
+            print("Final joint error:", round(joint_error, 5))
+            return False
+
+        set_joint_goal(redis_client, goal_joint_position)
+        time.sleep(DT)
+
+
+def run_tool_station_visits(
+    redis_client,
+    *,
+    tool_init_rad: np.ndarray,
+    max_joint_step: float,
+    joint_arrival_threshold: float,
+    station_dwell_s: float = DWELL_AT_STATION_POINT_S,
+    status_period_s: float = STATUS_PERIOD_S,
+    timeout_s: float = TIMEOUT_S,
+    path_trace: list[PathTraceSample] | None = None,
+    trace_start: float | None = None,
+) -> bool:
+    cfg = load_demo_day_config()
+
+    for name, return_home in STATION_VISIT_SEQUENCE:
+        target_rad = load_joint_waypoint_deg(cfg, name) * DEG_TO_RAD
+        current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
+        if not follow_joint_path_to_goal(
+            redis_client,
+            start_joint_position=current,
+            goal_joint_position=target_rad,
+            label=name,
+            max_joint_step=max_joint_step,
+            joint_arrival_threshold=joint_arrival_threshold,
+            dwell_s=station_dwell_s,
+            status_period_s=status_period_s,
+            timeout_s=timeout_s,
+            path_trace=path_trace,
+            trace_start=trace_start,
+        ):
+            return False
+
+        if return_home:
+            current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
+            if not follow_joint_path_to_goal(
+                redis_client,
+                start_joint_position=current,
+                goal_joint_position=tool_init_rad,
+                label="TOOL_INIT",
+                max_joint_step=max_joint_step,
+                joint_arrival_threshold=joint_arrival_threshold,
+                dwell_s=station_dwell_s,
+                status_period_s=status_period_s,
+                timeout_s=timeout_s,
+                path_trace=path_trace,
+                trace_start=trace_start,
+            ):
+                return False
+
+    for name in NAPKIN_VISIT_SEQUENCE:
+        target_rad = load_joint_waypoint_deg(cfg, name) * DEG_TO_RAD
+        current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
+        if not follow_joint_path_to_goal(
+            redis_client,
+            start_joint_position=current,
+            goal_joint_position=target_rad,
+            label=name,
+            max_joint_step=max_joint_step,
+            joint_arrival_threshold=joint_arrival_threshold,
+            dwell_s=station_dwell_s,
+            status_period_s=status_period_s,
+            timeout_s=timeout_s,
+            path_trace=path_trace,
+            trace_start=trace_start,
+        ):
+            return False
+
+    current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
+    return follow_joint_path_to_goal(
+        redis_client,
+        start_joint_position=current,
+        goal_joint_position=tool_init_rad,
+        label="TOOL_INIT",
+        max_joint_step=max_joint_step,
+        joint_arrival_threshold=joint_arrival_threshold,
+        dwell_s=station_dwell_s,
+        status_period_s=status_period_s,
+        timeout_s=timeout_s,
+        path_trace=path_trace,
+        trace_start=trace_start,
+    )
+
+
 def move_to_tool_init(
     *,
     config_file_name_expected: str = CONFIG_FILE_FOR_THIS_SCRIPT,
@@ -1241,6 +1457,18 @@ def move_to_tool_init(
             print("Reached TOOL_INIT.")
             if dwell_s > 0.0:
                 time.sleep(dwell_s)
+
+            if not run_tool_station_visits(
+                redis_client,
+                tool_init_rad=joint_goal,
+                max_joint_step=max_joint_step,
+                joint_arrival_threshold=joint_arrival_threshold,
+                status_period_s=status_period_s,
+                timeout_s=timeout_s,
+                path_trace=path_trace,
+                trace_start=trace_start,
+            ):
+                return finish(1)
             return finish(0)
 
         if timeout_s > 0.0 and time.perf_counter() - start > timeout_s:
