@@ -60,11 +60,16 @@ FACE_TRACKING_SIGN = 1.0
 CAMERA_INIT_POS_MM = np.array([-310.22, 592.11, 340.43], dtype=float)
 CAMERA_INIT_POS_M = CAMERA_INIT_POS_MM / 1000.0
 
+# Robot "home" pose to return to after the centered capture is taken.
+INIT_POS = np.array([0.54671, 0.11226, 0.33151], dtype=float)
+
 
 class CameraState(Enum):
     TRANSLATING = auto()
     ROTATING_LAST_JOINT = auto()
     FACE_TRACKING = auto()
+    RETURNING_LAST_JOINT = auto()
+    RETURNING_TRANSLATION = auto()
     DONE = auto()
 
 
@@ -556,6 +561,7 @@ def move_to_camera_init(
         joint_goal = None
         commanded_joint_position = None
         face_tracking_commanded_joint_position = None
+        pre_orientation_joint_position = None
 
         centered_frame_count = 0
         saved_raw_capture_path: Path | None = None
@@ -615,6 +621,7 @@ def move_to_camera_init(
                             redis_keys.sensor_joint_positions,
                             (7,),
                         )
+                        pre_orientation_joint_position = current_joint_position.copy()
                         joint_goal = current_joint_position.copy()
                         joint_goal[-1] = last_joint_target_deg * DEG_TO_RAD
                         commanded_joint_position = current_joint_position.copy()
@@ -775,8 +782,20 @@ def move_to_camera_init(
                 ):
                     saved_raw_capture_path = save_raw_capture(clean_frame, raw_captures_dir)
                     print(f"Saved centered raw capture: {saved_raw_capture_path}")
-                    state = CameraState.DONE
-                    return True
+
+                    # Begin return sequence: reverse the last-joint rotation first,
+                    # then translate back to INIT_POS along a fresh arc.
+                    joint_goal = pre_orientation_joint_position.copy()
+                    commanded_joint_position = current_joint_position.copy()
+                    set_joint_goal(redis_client, commanded_joint_position)
+                    state = CameraState.RETURNING_LAST_JOINT
+                    print("Phase 4: returning last joint to pre-orientation position.")
+                    print("Pre-orientation joint position:", pre_orientation_joint_position)
+                    print(
+                        "Commanded joint delta (deg):",
+                        ((joint_goal - current_joint_position) / DEG_TO_RAD).round(3),
+                    )
+                    continue
 
                 if preview:
                     draw_face_tracking_overlay(
@@ -795,6 +814,103 @@ def move_to_camera_init(
                         print("Face tracking stopped by user.")
                         state = CameraState.DONE
                         return True
+
+            elif state == CameraState.RETURNING_LAST_JOINT:
+                current_joint_position = read_np(
+                    redis_client,
+                    redis_keys.sensor_joint_positions,
+                    (7,),
+                )
+                delta = joint_goal - commanded_joint_position
+                distance = float(np.linalg.norm(delta))
+                if distance > max_joint_step:
+                    delta *= max_joint_step / distance
+                commanded_joint_position = commanded_joint_position + delta
+
+                joint_error = float(np.linalg.norm(joint_goal - current_joint_position))
+                commanded_error = float(np.linalg.norm(joint_goal - commanded_joint_position))
+                set_joint_goal(redis_client, commanded_joint_position)
+                print(
+                    "RETURNING_LAST_JOINT",
+                    "| joint_error:",
+                    round(joint_error, 5),
+                    "| commanded_remaining:",
+                    round(commanded_error, 5),
+                )
+
+                if joint_error < joint_arrival_threshold:
+                    # Switch back to cartesian control and build the return arc.
+                    current_position = read_np(
+                        redis_client,
+                        redis_keys.cartesian_task_current_position,
+                        (3,),
+                    )
+                    hold_orientation = read_np(
+                        redis_client,
+                        redis_keys.cartesian_task_current_orientation,
+                        (3, 3),
+                    )
+                    set_cartesian_goal(redis_client, current_position, hold_orientation)
+                    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
+                    print("Using controller:", CARTESIAN_CONTROLLER)
+                    settle_start = time.perf_counter()
+                    while time.perf_counter() - settle_start < joint_controller_settle_s:
+                        set_cartesian_goal(redis_client, current_position, hold_orientation)
+                        time.sleep(DT)
+
+                    translation_path, return_arc_radius, return_arc_side = build_translation_path(
+                        current_position,
+                        INIT_POS,
+                        sagitta_m=arc_sagitta_m,
+                        step_m=arc_step_m,
+                        arc_side=arc_side,
+                    )
+                    path_index = 0
+                    translation_target = translation_path[path_index]
+                    set_cartesian_goal(redis_client, translation_target, hold_orientation)
+                    state = CameraState.RETURNING_TRANSLATION
+                    print("Phase 5: returning along XY arc to INIT_POS.")
+                    print("Return waypoints:", len(translation_path))
+                    print("Return arc radius (m):", return_arc_radius)
+                    print("Return arc side:", return_arc_side)
+                    print("INIT_POS target:", INIT_POS)
+
+            elif state == CameraState.RETURNING_TRANSLATION:
+                current_position = read_np(
+                    redis_client,
+                    redis_keys.cartesian_task_current_position,
+                    (3,),
+                )
+                current_orientation = read_np(
+                    redis_client,
+                    redis_keys.cartesian_task_current_orientation,
+                    (3, 3),
+                )
+                translation_target = translation_path[path_index]
+                pos_err = position_error(current_position, translation_target)
+                hold_ori_err = orientation_error(current_orientation, hold_orientation)
+                set_cartesian_goal(redis_client, translation_target, hold_orientation)
+                print(
+                    "RETURNING_TRANSLATION",
+                    path_index + 1,
+                    "/",
+                    len(translation_path),
+                    "| pos_error:",
+                    round(pos_err, 5),
+                    "| hold_ori_error:",
+                    round(hold_ori_err, 5),
+                )
+
+                if pos_err < POS_TOL_M:
+                    path_index += 1
+                    if path_index >= len(translation_path):
+                        time.sleep(DWELL_AFTER_TRANSLATION_S)
+                        print(f"Reached INIT_POS. Return sequence complete.")
+                        state = CameraState.DONE
+                        return True
+                    else:
+                        translation_target = translation_path[path_index]
+                        set_cartesian_goal(redis_client, translation_target, hold_orientation)
 
             elif state == CameraState.DONE:
                 return True
