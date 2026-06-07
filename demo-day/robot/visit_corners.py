@@ -55,15 +55,30 @@ DWELL_AT_WAYPOINT_S = 1.0
 INTER_GOAL_REFRESH_S = 0.05          # how often to re-send the cartesian goal
 
 
+def _load_demo_day_config() -> dict:
+    with DEMO_DAY_CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _load_init_pos() -> np.ndarray:
     """Load INIT_POS from demo-day/config.json so all scripts share one source."""
-    with DEMO_DAY_CONFIG_PATH.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = _load_demo_day_config()
     return np.array(cfg["init_pos_m"], dtype=float)
+
+
+def _load_canvas_corner_x_offset_m() -> float:
+    """Load the calibration X-direction (depth) offset for canvas corners.
+
+    Applied additively to the X component of each TL/TR/BR/BL waypoint to
+    compensate for systematic depth inaccuracies in the AprilTag calibration.
+    """
+    cfg = _load_demo_day_config()
+    return float(cfg.get("canvas_corner_x_offset_m", 0.0))
 
 
 # Robot "home" pose -- shared with calibrate_canvas.py / orient_camera.py.
 INIT_POS = _load_init_pos()
+CANVAS_CORNER_X_OFFSET_M = _load_canvas_corner_x_offset_m()
 
 CORNER_ORDER = ("TL", "TR", "BR", "BL")
 
@@ -268,11 +283,25 @@ def run_visit_sequence(
     )
     print(f"Starting position: {current}")
 
-    corner_world = load_corner_world_positions(corners_json)
+    corner_world_raw = load_corner_world_positions(corners_json)
+    x_offset_vec = np.array(
+        [CANVAS_CORNER_X_OFFSET_M, 0.0, 0.0], dtype=float
+    )
+    corner_world = {
+        name: corner_world_raw[name] + x_offset_vec for name in CORNER_ORDER
+    }
+
     print("\nCanvas corners (world frame, meters):")
     print(f"  INIT_POS: {INIT_POS.tolist()}")
+    print(
+        f"  applying canvas_corner_x_offset_m = {CANVAS_CORNER_X_OFFSET_M:+.4f} m"
+        " to each TL/TR/BR/BL waypoint (X axis only)"
+    )
     for name in CORNER_ORDER:
-        print(f"  {name}: {np.round(corner_world[name], 5).tolist()}")
+        print(
+            f"  {name}: raw {np.round(corner_world_raw[name], 5).tolist()}"
+            f" -> adjusted {np.round(corner_world[name], 5).tolist()}"
+        )
 
     sequence: list[tuple[str, np.ndarray]] = [("INIT_POS", INIT_POS)]
     sequence.extend((name, corner_world[name]) for name in CORNER_ORDER)

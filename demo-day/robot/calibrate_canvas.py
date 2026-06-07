@@ -138,6 +138,23 @@ TAG_DICT = cv2.aruco.DICT_APRILTAG_36h11
 TAG_ID_TO_CORNER = {0: "TL", 1: "TR", 2: "BR", 3: "BL"}
 CORNER_ORDER = ("TL", "TR", "BR", "BL")
 
+# Which specific corner of each tag corresponds to the physical canvas
+# corner we want. Each entry is the (sign_x, sign_y) of the corner in the
+# tag's own local frame (x: right, y: up, z: out of the tag face) -- the
+# point will be (sx * s, sy * s, 0) with s = TAG_SIZE_M / 2.
+#
+# Layout (looking at the canvas, tags right-side-up):
+#   TL canvas corner  <- bottom-right corner of TL tag  (+x, -y)
+#   TR canvas corner  <- bottom-left  corner of TR tag  (-x, -y)
+#   BR canvas corner  <- bottom-left  corner of BR tag  (-x, -y)
+#   BL canvas corner  <- bottom-right corner of BL tag  (+x, -y)
+TAG_LOCAL_CORNER_SIGNS = {
+    "TL": (+1.0, -1.0),
+    "TR": (-1.0, -1.0),
+    "BR": (-1.0, -1.0),
+    "BL": (+1.0, -1.0),
+}
+
 # Camera mounted behind+above the brush tip.
 # Position of the camera origin expressed in the brush-tip frame, in meters.
 CAMERA_OFFSET_IN_TIP_FRAME_M = np.array([-0.07560, 0.00000, 0.04211], dtype=float)
@@ -251,7 +268,9 @@ def detect_tags(detector_bundle, gray):
 def estimate_tag_pose(image_corners_2d, tag_size_m, K, dist):
     """Solve PnP for a single tag.
 
-    Returns translation (3,) in the camera frame, in meters.
+    Returns (tvec, rvec) in the camera frame. ``tvec`` is the tag center
+    in meters; ``rvec`` is the Rodrigues rotation vector from the tag's
+    local frame to the camera frame.
     image_corners_2d: shape (4, 2), order TL, TR, BR, BL (OpenCV aruco order).
     """
     s = tag_size_m / 2.0
@@ -268,6 +287,26 @@ def estimate_tag_pose(image_corners_2d, tag_size_m, K, dist):
     if not ok:
         return None, None
     return tvec.flatten().astype(float), rvec.flatten().astype(float)
+
+
+def tag_corner_in_camera_frame(
+    tvec: np.ndarray,
+    rvec: np.ndarray,
+    tag_size_m: float,
+    sign_x: float,
+    sign_y: float,
+) -> np.ndarray:
+    """Project a specific tag-local corner into the camera frame.
+
+    The desired corner in the tag's local frame is
+    ``(sign_x * s, sign_y * s, 0)`` with ``s = tag_size_m / 2``.
+    """
+    s = tag_size_m / 2.0
+    corner_local = np.array(
+        [sign_x * s, sign_y * s, 0.0], dtype=float
+    )
+    R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=float))
+    return R @ corner_local + np.asarray(tvec, dtype=float)
 
 
 # ============================================================
@@ -384,11 +423,17 @@ def capture_corners(
                 if tag_id not in TAG_ID_TO_CORNER:
                     continue
                 name = TAG_ID_TO_CORNER[tag_id]
-                tvec, _ = estimate_tag_pose(corner_pts, TAG_SIZE_M, K, dist)
-                if tvec is None:
+                tvec, rvec = estimate_tag_pose(corner_pts, TAG_SIZE_M, K, dist)
+                if tvec is None or rvec is None:
                     continue
-                this_frame_positions[name] = tvec
-                pose_history[name].append(tvec)
+                # Track the precise canvas-corner of this tag rather than its
+                # center (e.g. for the TL tag we want its bottom-right corner).
+                sx, sy = TAG_LOCAL_CORNER_SIGNS[name]
+                corner_in_cam = tag_corner_in_camera_frame(
+                    tvec, rvec, TAG_SIZE_M, sx, sy
+                )
+                this_frame_positions[name] = corner_in_cam
+                pose_history[name].append(corner_in_cam)
                 if len(pose_history[name]) > POSE_HISTORY_FRAMES:
                     pose_history[name].pop(0)
 
@@ -464,6 +509,9 @@ def build_output_payload(capture_result, robot_pos_at_capture, robot_ori_at_capt
         "units": "meters",
         "tag_family": "tag36h11",
         "tag_ids": TAG_ID_TO_CORNER,
+        "tag_local_corner_signs": {
+            name: list(TAG_LOCAL_CORNER_SIGNS[name]) for name in CORNER_ORDER
+        },
         "tag_size_m": TAG_SIZE_M,
         "camera_offset_in_tip_frame_m": CAMERA_OFFSET_IN_TIP_FRAME_M.tolist(),
         "R_camera_to_tip": R_CAM_TO_TIP.tolist(),
