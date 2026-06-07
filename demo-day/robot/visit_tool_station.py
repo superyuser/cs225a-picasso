@@ -69,6 +69,16 @@ SCAN_STATUS_PERIOD_S = 0.25
 SCAN_TIMEOUT_S = 30.0
 DEFAULT_PATH_LOG_DIR = DEMO_DAY_DIR / "path-logs"
 
+# Outputs consumed by demo-day/robot/visit_tool_volumes.py.
+DEFAULT_TOOL_STATION_MODEL_JSON = DEMO_DAY_DIR / "tool_station_model.json"
+DEFAULT_TOOL_STATION_OBSERVATION_JSON = DEMO_DAY_DIR / "tool_station_observation.json"
+
+# Camera intrinsics file (same one used by demo-day/robot/calibrate_canvas.py).
+DEFAULT_CAMERA_INTRINSICS_JSON = SCRIPT_DIR / "camera_intrinsics.json"
+TAG_SIZE_M = 0.035
+TOOL_OBSERVATION_FRAMES = 12
+DEFAULT_HFOV_DEG = 65.0
+
 
 @dataclass
 class RedisKeys:
@@ -754,6 +764,279 @@ def scan_tool_tags(
             return 1
 
 
+def load_camera_intrinsics(path: Path, frame_w: int, frame_h: int):
+    """Load (K, dist, calibrated) from a JSON file, or fall back to an HFOV
+    approximation if the file is missing. Mirrors calibrate_canvas.py."""
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        K = np.array(payload["camera_matrix"], dtype=float)
+        dist = np.array(
+            payload.get("dist_coeffs", [0.0, 0.0, 0.0, 0.0, 0.0]),
+            dtype=float,
+        )
+        print(f"Loaded camera intrinsics from {path}")
+        return K, dist, True
+
+    fx = fy = 0.5 * frame_w / math.tan(math.radians(DEFAULT_HFOV_DEG / 2.0))
+    cx = frame_w / 2.0
+    cy = frame_h / 2.0
+    K = np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=float
+    )
+    dist = np.zeros((5,), dtype=float)
+    print(
+        f"WARNING: no intrinsics file at {path}. Using {DEFAULT_HFOV_DEG} deg"
+        " HFOV approximation. Tool-station Z depth will be inaccurate --"
+        " calibrate the camera and provide it for accurate results."
+    )
+    return K, dist, False
+
+
+def average_rotation_matrices(matrices: list[np.ndarray]) -> np.ndarray:
+    """Average rotation matrices via SVD re-orthogonalization."""
+    if not matrices:
+        raise ValueError("matrices must be non-empty")
+    if len(matrices) == 1:
+        return np.asarray(matrices[0], dtype=float)
+
+    mean_matrix = np.mean(np.stack(matrices, axis=0), axis=0)
+    u, _, vt = np.linalg.svd(mean_matrix)
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vt
+    return rotation
+
+
+def estimate_tool_tag_pose(
+    image_corners_2d: np.ndarray,
+    tag_size_m: float,
+    K: np.ndarray,
+    dist: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Run cv2.solvePnP for one tool-station tag (returns tvec, rvec)."""
+    s = tag_size_m / 2.0
+    object_points = np.array(
+        [
+            [-s,  s, 0.0],
+            [ s,  s, 0.0],
+            [ s, -s, 0.0],
+            [-s, -s, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    image_points = np.ascontiguousarray(
+        image_corners_2d.reshape(4, 2)
+    ).astype(np.float32)
+    ok, rvec, tvec = cv2.solvePnP(
+        object_points, image_points, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE
+    )
+    if not ok:
+        return None
+    return tvec.flatten().astype(float), rvec.flatten().astype(float)
+
+
+@dataclass
+class ToolTagObservationSnapshot:
+    """Tag poses and EE pose captured on the same camera frames."""
+
+    tag_poses_in_camera_frame: dict[int, dict[str, list[float]]]
+    ee_position_world_m: np.ndarray
+    ee_orientation_world: np.ndarray
+    num_frames: int
+
+
+def capture_tool_tag_observation(
+    *,
+    cap,
+    detector_bundle,
+    redis_client,
+    intrinsics_json: Path,
+    num_frames: int,
+) -> ToolTagObservationSnapshot | None:
+    """Capture a short snapshot averaging tag PnP poses and EE Cartesian pose.
+
+    For each frame where all four tool tags are visible, the current Cartesian
+    position and orientation are read from Redis and stored alongside the tag
+    poses. The returned EE pose is the average over those synchronized frames
+    (not the nominal TOOL_INIT joint target, which may differ due to joint
+    tracking error).
+    """
+    if cv2 is None:
+        raise RuntimeError("`cv2` package is not installed.")
+
+    tvec_history: dict[int, list[np.ndarray]] = {tid: [] for tid in TOOL_TAG_IDS}
+    rvec_history: dict[int, list[np.ndarray]] = {tid: [] for tid in TOOL_TAG_IDS}
+    ee_pos_history: list[np.ndarray] = []
+    ee_ori_history: list[np.ndarray] = []
+    K = None
+    dist = None
+
+    frames_collected = 0
+    attempts = 0
+    while frames_collected < num_frames and attempts < num_frames * 4:
+        attempts += 1
+        ok, frame = cap.read()
+        if not ok:
+            print("Could not read camera frame during tool-station snapshot.")
+            return None
+
+        if K is None:
+            h, w = frame.shape[:2]
+            K, dist, _ = load_camera_intrinsics(intrinsics_json, w, h)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ids, corners_2d = detect_tags(detector_bundle, gray)
+        ids_list = ids.tolist() if ids.size > 0 else []
+
+        per_frame_tvecs: dict[int, np.ndarray] = {}
+        per_frame_rvecs: dict[int, np.ndarray] = {}
+        for tag_id, corner_pts in zip(ids_list, corners_2d):
+            if tag_id not in TOOL_TAG_IDS:
+                continue
+            pose = estimate_tool_tag_pose(corner_pts, TAG_SIZE_M, K, dist)
+            if pose is None:
+                continue
+            tvec, rvec = pose
+            per_frame_tvecs[tag_id] = tvec
+            per_frame_rvecs[tag_id] = rvec
+
+        if not all(tid in per_frame_tvecs for tid in TOOL_TAG_IDS):
+            continue
+
+        ee_pos = read_np(
+            redis_client,
+            redis_keys.cartesian_task_current_position,
+            (3,),
+        )
+        ee_ori = read_np(
+            redis_client,
+            redis_keys.cartesian_task_current_orientation,
+            (3, 3),
+        )
+
+        for tag_id in TOOL_TAG_IDS:
+            tvec_history[tag_id].append(per_frame_tvecs[tag_id])
+            rvec_history[tag_id].append(per_frame_rvecs[tag_id])
+        ee_pos_history.append(ee_pos)
+        ee_ori_history.append(ee_ori)
+        frames_collected += 1
+
+    if frames_collected == 0:
+        print(
+            "Tool-station snapshot failed: could not collect a single frame"
+            " with all tool tags visible."
+        )
+        return None
+
+    poses: dict[int, dict[str, list[float]]] = {}
+    for tag_id in TOOL_TAG_IDS:
+        tvecs = np.array(tvec_history[tag_id], dtype=float)
+        rvecs = np.array(rvec_history[tag_id], dtype=float)
+        poses[tag_id] = {
+            "tvec": [round(float(v), 6) for v in tvecs.mean(axis=0)],
+            "rvec": [round(float(v), 6) for v in rvecs.mean(axis=0)],
+            "num_frames": int(tvecs.shape[0]),
+        }
+
+    ee_pos_mean = np.mean(np.stack(ee_pos_history, axis=0), axis=0)
+    ee_ori_mean = average_rotation_matrices(ee_ori_history)
+
+    print(
+        f"Captured tool-station snapshot: averaged {frames_collected} frames"
+        " with all 4 tool tags visible."
+    )
+    print(
+        "Synchronized EE Cartesian pose at tag scan (world frame):",
+        np.round(ee_pos_mean, 5).tolist(),
+    )
+    return ToolTagObservationSnapshot(
+        tag_poses_in_camera_frame=poses,
+        ee_position_world_m=ee_pos_mean,
+        ee_orientation_world=ee_ori_mean,
+        num_frames=frames_collected,
+    )
+
+
+def save_tool_station_artifacts(
+    *,
+    cap,
+    detector_bundle,
+    redis_client,
+    intrinsics_json: Path,
+    model_json_path: Path,
+    observation_json_path: Path,
+    snapshot_frames: int,
+) -> int:
+    """Save the station model + a runtime snapshot (tag poses + EE pose).
+
+    Called after `scan_tool_tags()` returns successfully and the robot is at
+    TOOL_INIT. Minimises changes to the existing trajectory: no robot motion,
+    no controller switches. Returns 0 on success, 1 on failure.
+    """
+    try:
+        from model_tool_station import PaintToolStationModel
+    except ImportError as exc:  # pragma: no cover - defensive
+        print("Could not import model_tool_station:", exc)
+        return 1
+
+    model = PaintToolStationModel()
+    saved_model_path = model.save_json(model_json_path)
+    print(f"Saved tool-station model JSON: {saved_model_path}")
+
+    snapshot = capture_tool_tag_observation(
+        cap=cap,
+        detector_bundle=detector_bundle,
+        redis_client=redis_client,
+        intrinsics_json=intrinsics_json,
+        num_frames=snapshot_frames,
+    )
+    if snapshot is None:
+        print(
+            "Skipping observation JSON: snapshot could not collect a frame"
+            " with all four tool tags visible."
+        )
+        return 1
+
+    observation_payload = {
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "robot_name": ROBOT_NAME,
+        "tag_family": TAG_FAMILY,
+        "tag_size_m": TAG_SIZE_M,
+        "tool_tag_ids": list(TOOL_TAG_IDS),
+        "reference_tag_id": model.reference_tag_id,
+        "snapshot_num_frames": snapshot.num_frames,
+        "note": (
+            "ee_position_world_m and ee_orientation_world are the Redis "
+            "Cartesian pose averaged over the same frames as the tag scan. "
+            "This is the actual measured pose at tag observation time, not "
+            "the nominal TOOL_INIT joint target."
+        ),
+        "ee_position_world_m": [float(v) for v in snapshot.ee_position_world_m],
+        "ee_orientation_world": [
+            [float(v) for v in row] for row in snapshot.ee_orientation_world
+        ],
+        "camera_offset_in_tip_frame_m": [-0.07560, 0.00000, 0.04211],
+        "R_camera_to_tip": [
+            [0.0,  0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        "tag_poses_in_camera_frame": {
+            str(tag_id): pose
+            for tag_id, pose in snapshot.tag_poses_in_camera_frame.items()
+        },
+        "model_json_path": str(saved_model_path),
+    }
+
+    observation_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with observation_json_path.open("w", encoding="utf-8") as f:
+        json.dump(observation_payload, f, indent=2)
+    print(f"Saved tool-station observation JSON: {observation_json_path}")
+    return 0
+
+
 def move_to_tool_init(
     *,
     config_file_name_expected: str = CONFIG_FILE_FOR_THIS_SCRIPT,
@@ -1040,6 +1323,40 @@ def parse_args() -> argparse.Namespace:
             f"(default: {SCAN_TIMEOUT_S})."
         ),
     )
+    parser.add_argument(
+        "--intrinsics-json",
+        default=str(DEFAULT_CAMERA_INTRINSICS_JSON),
+        help=(
+            "Camera intrinsics JSON (same format as calibrate_canvas.py) "
+            f"(default: {DEFAULT_CAMERA_INTRINSICS_JSON})."
+        ),
+    )
+    parser.add_argument(
+        "--tool-station-model-json",
+        default=str(DEFAULT_TOOL_STATION_MODEL_JSON),
+        help=(
+            "Where to save the exported tool-station model JSON "
+            f"(default: {DEFAULT_TOOL_STATION_MODEL_JSON})."
+        ),
+    )
+    parser.add_argument(
+        "--tool-station-observation-json",
+        default=str(DEFAULT_TOOL_STATION_OBSERVATION_JSON),
+        help=(
+            "Where to save the runtime tag/EE snapshot used by "
+            "visit_tool_volumes.py "
+            f"(default: {DEFAULT_TOOL_STATION_OBSERVATION_JSON})."
+        ),
+    )
+    parser.add_argument(
+        "--tool-observation-frames",
+        type=int,
+        default=TOOL_OBSERVATION_FRAMES,
+        help=(
+            "Frames to average over when snapshotting tool-tag poses "
+            f"(default: {TOOL_OBSERVATION_FRAMES})."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1066,7 +1383,7 @@ def main() -> int:
         if move_result != 0:
             return move_result
 
-        return scan_tool_tags(
+        scan_result = scan_tool_tags(
             cap=cap,
             detector_bundle=detector_bundle,
             preview=not args.no_preview,
@@ -1074,6 +1391,27 @@ def main() -> int:
             status_period_s=args.scan_status_period_s,
             timeout_s=args.scan_timeout_s,
         )
+        if scan_result != 0:
+            return scan_result
+
+        # Export model + runtime snapshot for demo-day/robot/visit_tool_volumes.py.
+        if redis is None:
+            print(
+                "`redis` package is not installed; skipping tool-station"
+                " observation JSON export."
+            )
+            return 0
+        redis_client = redis.Redis()
+        save_tool_station_artifacts(
+            cap=cap,
+            detector_bundle=detector_bundle,
+            redis_client=redis_client,
+            intrinsics_json=Path(args.intrinsics_json),
+            model_json_path=Path(args.tool_station_model_json),
+            observation_json_path=Path(args.tool_station_observation_json),
+            snapshot_frames=args.tool_observation_frames,
+        )
+        return 0
 
     except RuntimeError as exc:
         print("Could not start tool-station run:")
