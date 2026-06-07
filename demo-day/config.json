@@ -1,5 +1,5 @@
 {
   "units": "meters",
-  "init_pos_m": [0.40, 0.11226, 0.33151],
-  "canvas_corner_x_offset_m": -0.020
+  "init_pos_m": [0.40, 0.11226, 0.3151],
+  "canvas_corner_x_offset_m": -0.025
 }
