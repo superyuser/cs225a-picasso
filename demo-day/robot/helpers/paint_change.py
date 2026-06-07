@@ -10,6 +10,9 @@ from typing import Callable
 import numpy as np
 
 from .joint_motion import (
+    JOINT_ARRIVAL_THRESHOLD,
+    JOINT_MAX_STEP_DEG,
+    TIMEOUT_S,
     ToolInitApproachResult,
     approach_tool_init,
     follow_joint_path_to_goal,
@@ -150,8 +153,8 @@ def run_paint_change_sequence(
     pos_tol_m: float = POS_TOL_M,
     hover_dwell_s: float = DEFAULT_HOVER_DWELL_S,
     dip_dwell_s: float = DEFAULT_DIP_DWELL_S,
-    joint_arrival_threshold: float = 0.25,
-    joint_max_step_deg: float = 0.5,
+    joint_arrival_threshold: float = JOINT_ARRIVAL_THRESHOLD,
+    joint_max_step_deg: float = JOINT_MAX_STEP_DEG,
     status_period_s: float = STATUS_PERIOD_S,
     timeout_s: float = TIMEOUT_S,
     use_cached_tool_init_path: bool = True,
