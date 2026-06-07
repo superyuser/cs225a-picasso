@@ -1,36 +1,12 @@
-"""Visit each paint/water station container after visit_tool_station.py.
+"""Tool-station coordinate math, JSON I/O, and Cartesian volume visits.
 
-Pre-conditions:
-    * Robot is at the TOOL_INIT joint pose, reached by running
-      demo-day/robot/visit_tool_station.py first.
-    * demo-day/tool_station_model.json and
-      demo-day/tool_station_observation.json have just been written by
-      visit_tool_station.py.
-
-The script transforms the tool-station model (see
-demo-day/robot/model_tool_station.py) into the robot world frame using the
-Redis Cartesian pose recorded during the AprilTag scan (not the nominal
-TOOL_INIT joint target), then issues a Cartesian sequence:
-
-    SCAN_REFERENCE -> P1_INIT -> P2_INIT -> P3_INIT -> WATER_INIT
-                                                    -> SCAN_REFERENCE
-
-P*_INIT and WATER_INIT are "hover" poses (init_hover_z_offset_mm above each
-container top). Orientation from the tag-scan snapshot is held fixed
-throughout; only position changes between waypoints.
-
-Usage:
-    python robot/visit_tool_volumes.py
-    python robot/visit_tool_volumes.py --dwell-s 0.75
-    python robot/visit_tool_volumes.py --skip-final-tool-init
+Used by demo-day/robot/visit_tool_station.py for coordinate math, JSON I/O,
+and Cartesian volume visits.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import math
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,22 +15,22 @@ from typing import Any
 
 import numpy as np
 
-try:
-    import redis
-except ImportError:
-    redis = None
-
-# Local import; the model lives next to this script.
-from model_tool_station import (  # type: ignore[import-not-found]
+from .model_tool_station import (
     INIT_VISIT_ORDER,
     PaintToolStationModel,
     VOLUME_NAME_TO_INIT_LABEL,
     station_point_in_reference_tag_local_m,
 )
 
+try:
+    import redis
+except ImportError:
+    redis = None
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEMO_DAY_DIR = SCRIPT_DIR.parent
+
+HELPERS_DIR = Path(__file__).resolve().parent
+ROBOT_DIR = HELPERS_DIR.parent
+DEMO_DAY_DIR = ROBOT_DIR.parent
 
 DEFAULT_TOOL_STATION_MODEL_JSON = DEMO_DAY_DIR / "tool_station_model.json"
 DEFAULT_TOOL_STATION_OBSERVATION_JSON = DEMO_DAY_DIR / "tool_station_observation.json"
@@ -94,9 +70,30 @@ class RedisKeys:
 redis_keys = RedisKeys()
 
 
-# ============================================================
-# REDIS HELPERS (same style as visit_corners.py / visit_tool_station.py)
-# ============================================================
+@dataclass
+class VolumeWaypoint:
+    label: str
+    world_position_m: np.ndarray
+    station_position_mm: np.ndarray | None
+    volume_name: str | None
+
+
+@dataclass
+class ToolStationCalibration:
+    """World-frame targets derived from model + observation JSON."""
+
+    model_json_path: Path
+    observation_json_path: Path
+    world_json_path: Path
+    observation: dict[str, Any]
+    scan_reference_position_m: np.ndarray
+    hold_orientation: np.ndarray
+    waypoints: list[VolumeWaypoint]
+
+
+# ---------------------------------------------------------------------------
+# Redis helpers
+# ---------------------------------------------------------------------------
 
 def decode_redis_value(val):
     if isinstance(val, bytes):
@@ -160,14 +157,9 @@ def position_error(current_pos, goal_pos) -> float:
     )
 
 
-# ============================================================
-# WORLD-FRAME MATH
-# ============================================================
-
-# Rotation mapping station-frame vectors into a tag's local PnP frame.
-# See model_tool_station.py for the derivation.
-R_STATION_TO_TAG_LOCAL = np.diag([-1.0, -1.0, 1.0])
-
+# ---------------------------------------------------------------------------
+# Coordinate transforms
+# ---------------------------------------------------------------------------
 
 def station_point_in_camera_frame_m(
     p_station_m: np.ndarray,
@@ -177,8 +169,7 @@ def station_point_in_camera_frame_m(
     tag_size_m: float,
     tag_tl_station_m: np.ndarray,
 ) -> np.ndarray:
-    """Transform a point from station frame to camera frame (meters)."""
-    import cv2  # local import keeps the module importable without OpenCV
+    import cv2
 
     p_in_tag_local = station_point_in_reference_tag_local_m(
         p_station_m,
@@ -197,7 +188,6 @@ def camera_point_in_world_frame_m(
     R_cam_to_tip: np.ndarray,
     camera_offset_in_tip_m: np.ndarray,
 ) -> np.ndarray:
-    """Transform a camera-frame point through tip frame to world frame."""
     p_tip = R_cam_to_tip @ np.asarray(p_cam_m, dtype=float) + camera_offset_in_tip_m
     return ee_pos_world + R_ee_world @ p_tip
 
@@ -205,15 +195,9 @@ def camera_point_in_world_frame_m(
 def load_scan_reference_pose(
     observation: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Load the EE pose recorded during the AprilTag scan snapshot.
-
-    This is the actual Redis Cartesian pose averaged over the same camera
-    frames as the tag detections, not the nominal TOOL_INIT joint target.
-    """
     if "ee_position_world_m" not in observation or "ee_orientation_world" not in observation:
         raise RuntimeError(
-            "Observation JSON is missing ee_position_world_m / "
-            "ee_orientation_world. Re-run visit_tool_station.py."
+            "Observation JSON is missing ee_position_world_m / ee_orientation_world."
         )
     position = np.array(observation["ee_position_world_m"], dtype=float)
     orientation = np.array(observation["ee_orientation_world"], dtype=float)
@@ -264,29 +248,17 @@ def station_point_in_world_frame_m(
     )
 
 
-# ============================================================
-# WAYPOINT BUILDER
-# ============================================================
-
-@dataclass
-class Waypoint:
-    label: str
-    world_position_m: np.ndarray
-    station_position_mm: np.ndarray | None
-    volume_name: str | None
-
-
 def build_volume_waypoints(
     *,
     model: PaintToolStationModel,
     observation: dict[str, Any],
-) -> list[Waypoint]:
+) -> list[VolumeWaypoint]:
     tag_size_m = float(observation.get("tag_size_m", model.tag_size_mm * 1.0e-3))
     reference_tag_id = int(
         observation.get("reference_tag_id", model.reference_tag_id)
     )
 
-    waypoints: list[Waypoint] = []
+    waypoints: list[VolumeWaypoint] = []
     for volume_name in INIT_VISIT_ORDER:
         volume = model.get_volume(volume_name)
         station_point_mm = volume.init_hover_point_mm()
@@ -298,7 +270,7 @@ def build_volume_waypoints(
             reference_tag_id=reference_tag_id,
         )
         waypoints.append(
-            Waypoint(
+            VolumeWaypoint(
                 label=VOLUME_NAME_TO_INIT_LABEL[volume_name],
                 world_position_m=p_world,
                 station_position_mm=station_point_mm,
@@ -311,7 +283,7 @@ def build_volume_waypoints(
 def save_world_positions_json(
     *,
     path: Path,
-    waypoints: list[Waypoint],
+    waypoints: list[VolumeWaypoint],
     scan_reference_position_m: np.ndarray,
     hold_orientation: np.ndarray,
     observation_path: Path,
@@ -347,9 +319,64 @@ def save_world_positions_json(
     return path
 
 
-# ============================================================
-# CARTESIAN MOTION
-# ============================================================
+def load_observation_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compute_tool_station_calibration(
+    *,
+    model_json_path: Path,
+    observation_json_path: Path,
+    world_json_path: Path,
+) -> ToolStationCalibration:
+    """Load observation JSON and compute/export world-frame volume waypoints."""
+    if not model_json_path.is_file():
+        raise FileNotFoundError(f"Tool-station model JSON not found: {model_json_path}")
+    if not observation_json_path.is_file():
+        raise FileNotFoundError(
+            f"Tool-station observation JSON not found: {observation_json_path}"
+        )
+
+    observation = load_observation_json(observation_json_path)
+    scan_reference_position_m, hold_orientation = load_scan_reference_pose(observation)
+    model = PaintToolStationModel()
+    waypoints = build_volume_waypoints(model=model, observation=observation)
+
+    saved_world_path = save_world_positions_json(
+        path=world_json_path,
+        waypoints=waypoints,
+        scan_reference_position_m=scan_reference_position_m,
+        hold_orientation=hold_orientation,
+        observation_path=observation_json_path,
+        model_path=model_json_path,
+    )
+    print(f"Saved world-frame waypoints JSON: {saved_world_path}")
+
+    print("\nComputed world-frame hover waypoints (relative to scan reference):")
+    for wp in waypoints:
+        delta = wp.world_position_m - scan_reference_position_m
+        print(
+            f"  {wp.label} (from {wp.volume_name}):"
+            f" station {np.round(wp.station_position_mm, 3).tolist()} mm"
+            f" -> world {np.round(wp.world_position_m, 5).tolist()} m"
+            f" (delta {np.round(delta, 5).tolist()} m)"
+        )
+
+    return ToolStationCalibration(
+        model_json_path=model_json_path,
+        observation_json_path=observation_json_path,
+        world_json_path=saved_world_path,
+        observation=observation,
+        scan_reference_position_m=scan_reference_position_m,
+        hold_orientation=hold_orientation,
+        waypoints=waypoints,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cartesian motion
+# ---------------------------------------------------------------------------
 
 def go_to_waypoint(
     redis_client,
@@ -405,48 +432,18 @@ def go_to_waypoint(
     return True
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
-def run_visit_volumes(
+def visit_tool_volume_waypoints(
+    redis_client,
+    calibration: ToolStationCalibration,
     *,
-    model_json_path: Path,
-    observation_json_path: Path,
-    world_json_path: Path,
-    dwell_s: float,
-    skip_final_tool_init: bool,
-    timeout_per_waypoint_s: float,
-    status_period_s: float,
-) -> int:
-    if not model_json_path.is_file():
-        print(f"Tool-station model JSON not found: {model_json_path}")
-        print("Run demo-day/robot/visit_tool_station.py first.")
-        return 1
-    if not observation_json_path.is_file():
-        print(f"Tool-station observation JSON not found: {observation_json_path}")
-        print("Run demo-day/robot/visit_tool_station.py first.")
-        return 1
-
-    with observation_json_path.open("r", encoding="utf-8") as f:
-        observation = json.load(f)
-
-    scan_reference_position_m, hold_orientation = load_scan_reference_pose(
-        observation
-    )
-
-    # The model in memory shares the schema with the saved JSON; we use the
-    # in-memory instance for `init_hover_point_mm()`. If you tune the model
-    # parameters between runs, re-export via visit_tool_station.py.
-    model = PaintToolStationModel()
-
-    if redis is None:
-        print("`redis` package is not installed.")
-        return 1
-
-    redis_client = redis.Redis()
-    if not ensure_robot_ready(redis_client):
-        return 1
+    dwell_s: float = DWELL_AT_WAYPOINT_S,
+    skip_final_scan_reference: bool = False,
+    timeout_per_waypoint_s: float = TIMEOUT_PER_WAYPOINT_S,
+    status_period_s: float = STATUS_PERIOD_S,
+) -> bool:
+    """Move P1_INIT -> P2_INIT -> P3_INIT -> WATER_INIT (orientation fixed)."""
+    scan_reference_position_m = calibration.scan_reference_position_m
+    hold_orientation = calibration.hold_orientation
 
     current_position = read_np(
         redis_client,
@@ -454,36 +451,12 @@ def run_visit_volumes(
         (3,),
     )
 
-    print("Using scan-reference pose from observation JSON (not nominal TOOL_INIT):")
+    print("Using scan-reference pose from calibration JSON:")
     print("  scan_reference_position_world_m:", scan_reference_position_m.tolist())
     print("  hold_orientation (fixed throughout):")
     print(hold_orientation)
     print("Current Cartesian position:", current_position.tolist())
 
-    waypoints = build_volume_waypoints(model=model, observation=observation)
-
-    print("\nComputed world-frame hover waypoints (relative to scan reference):")
-    for wp in waypoints:
-        delta = wp.world_position_m - scan_reference_position_m
-        print(
-            f"  {wp.label} (from {wp.volume_name}):"
-            f" station {np.round(wp.station_position_mm, 3).tolist()} mm"
-            f" -> world {np.round(wp.world_position_m, 5).tolist()} m"
-            f" (delta {np.round(delta, 5).tolist()} m)"
-        )
-
-    saved_world_path = save_world_positions_json(
-        path=world_json_path,
-        waypoints=waypoints,
-        scan_reference_position_m=scan_reference_position_m,
-        hold_orientation=hold_orientation,
-        observation_path=observation_json_path,
-        model_path=model_json_path,
-    )
-    print(f"Saved world-frame waypoints JSON: {saved_world_path}")
-
-    # Hand control to the Cartesian controller. Hold the scan orientation and
-    # start from the measured current position so the controller does not snap.
     set_cartesian_goal(redis_client, current_position, hold_orientation)
     set_active_controller(redis_client, CARTESIAN_CONTROLLER)
     print(f"\nUsing controller: {CARTESIAN_CONTROLLER}")
@@ -494,9 +467,9 @@ def run_visit_volumes(
         time.sleep(DT)
 
     sequence: list[tuple[str, np.ndarray]] = [
-        (wp.label, wp.world_position_m) for wp in waypoints
+        (wp.label, wp.world_position_m) for wp in calibration.waypoints
     ]
-    if not skip_final_tool_init:
+    if not skip_final_scan_reference:
         sequence.append(("SCAN_REFERENCE", scan_reference_position_m))
 
     print("\nWaypoint sequence:")
@@ -514,86 +487,48 @@ def run_visit_volumes(
             status_period_s=status_period_s,
         )
         if not ok:
-            return 1
+            return False
 
     print("\nFinished visiting all tool-station volumes.")
-    return 0
+    return True
 
 
-# ============================================================
-# CLI
-# ============================================================
+def run_volume_visit_from_json(
+    *,
+    model_json_path: Path = DEFAULT_TOOL_STATION_MODEL_JSON,
+    observation_json_path: Path = DEFAULT_TOOL_STATION_OBSERVATION_JSON,
+    world_json_path: Path = DEFAULT_TOOL_STATION_WORLD_JSON,
+    dwell_s: float = DWELL_AT_WAYPOINT_S,
+    skip_final_scan_reference: bool = False,
+    timeout_per_waypoint_s: float = TIMEOUT_PER_WAYPOINT_S,
+    status_period_s: float = STATUS_PERIOD_S,
+    redis_client=None,
+) -> int:
+    """Load calibration JSON and run the volume visit sequence."""
+    if redis is None and redis_client is None:
+        print("`redis` package is not installed.")
+        return 1
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--model-json",
-        default=str(DEFAULT_TOOL_STATION_MODEL_JSON),
-        help=f"Tool-station model JSON (default: {DEFAULT_TOOL_STATION_MODEL_JSON}).",
-    )
-    parser.add_argument(
-        "--observation-json",
-        default=str(DEFAULT_TOOL_STATION_OBSERVATION_JSON),
-        help=(
-            "Snapshot from visit_tool_station.py with tag poses + EE pose "
-            f"(default: {DEFAULT_TOOL_STATION_OBSERVATION_JSON})."
-        ),
-    )
-    parser.add_argument(
-        "--world-json",
-        default=str(DEFAULT_TOOL_STATION_WORLD_JSON),
-        help=(
-            "Where to save the computed world-frame waypoints "
-            f"(default: {DEFAULT_TOOL_STATION_WORLD_JSON})."
-        ),
-    )
-    parser.add_argument(
-        "--dwell-s",
-        type=float,
-        default=DWELL_AT_WAYPOINT_S,
-        help=f"Seconds to dwell at each waypoint (default: {DWELL_AT_WAYPOINT_S}).",
-    )
-    parser.add_argument(
-        "--skip-final-tool-init",
-        action="store_true",
-        help="Stop at WATER_INIT instead of returning to the scan-reference pose.",
-    )
-    parser.add_argument(
-        "--timeout-per-waypoint-s",
-        type=float,
-        default=TIMEOUT_PER_WAYPOINT_S,
-        help=(
-            "Maximum seconds to wait at each waypoint. Use 0 to disable "
-            f"(default: {TIMEOUT_PER_WAYPOINT_S})."
-        ),
-    )
-    parser.add_argument(
-        "--status-period-s",
-        type=float,
-        default=STATUS_PERIOD_S,
-        help=(
-            "Seconds between progress prints. Use 0 to print every loop "
-            f"(default: {STATUS_PERIOD_S})."
-        ),
-    )
-    return parser.parse_args()
+    try:
+        calibration = compute_tool_station_calibration(
+            model_json_path=model_json_path,
+            observation_json_path=observation_json_path,
+            world_json_path=world_json_path,
+        )
+    except FileNotFoundError as exc:
+        print(exc)
+        return 1
 
+    client = redis_client if redis_client is not None else redis.Redis()
+    if not ensure_robot_ready(client):
+        return 1
 
-def main() -> int:
-    args = parse_args()
-    return run_visit_volumes(
-        model_json_path=Path(args.model_json),
-        observation_json_path=Path(args.observation_json),
-        world_json_path=Path(args.world_json),
-        dwell_s=args.dwell_s,
-        skip_final_tool_init=args.skip_final_tool_init,
-        timeout_per_waypoint_s=args.timeout_per_waypoint_s,
-        status_period_s=args.status_period_s,
+    ok = visit_tool_volume_waypoints(
+        client,
+        calibration,
+        dwell_s=dwell_s,
+        skip_final_scan_reference=skip_final_scan_reference,
+        timeout_per_waypoint_s=timeout_per_waypoint_s,
+        status_period_s=status_period_s,
     )
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    return 0 if ok else 1

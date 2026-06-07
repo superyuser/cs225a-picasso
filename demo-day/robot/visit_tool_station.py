@@ -1,21 +1,20 @@
-"""Move the robot to the tool-station joint pose and scan tool AprilTags.
+"""Move to the tool station, calibrate from AprilTags, and visit paint/water cups.
 
-The target joint angles are loaded from demo-day/config.json as ordered tool
-waypoints. The robot first moves to INIT_POS with the Cartesian controller
-while holding its current orientation. Then the OpenSai joint controller is
-fed one smooth joint-space trajectory through TOOL_SAFE_APPROACH,
-TOOL_SAFE_APPROACH_2, and TOOL_INIT. The wrist camera opens before robot
-motion starts.
-
-As soon as TOOL_INIT is reached (within joint arrival tolerance), the script
-writes demo-day/tool_station_model.json and demo-day/tool_station_observation.json
-using whichever tool tag is visible as the reference (prefer id 10). A
-follow-up camera scan optionally verifies that all four tags are visible.
+Flow:
+    1. INIT_POS (Cartesian) -> TOOL_SAFE_APPROACH -> TOOL_SAFE_APPROACH_2
+       -> TOOL_INIT (joint trajectory, unchanged).
+    2. At TOOL_INIT, snapshot visible tool tags + Redis Cartesian pose; write
+       demo-day/tool_station_model.json and tool_station_observation.json.
+    3. Compute world-frame P1/P2/P3/WATER hover positions, write
+       tool_station_world_positions.json, then visit each in Cartesian mode
+       (orientation fixed from the scan).
 
 Usage:
     python robot/visit_tool_station.py
     python robot/visit_tool_station.py --joint-max-step-deg 0.25
     python robot/visit_tool_station.py --no-preview
+    python robot/visit_tool_station.py --skip-volume-visit
+    python robot/visit_tool_station.py --volumes-from-json
 """
 
 from __future__ import annotations
@@ -42,6 +41,12 @@ try:
     import redis
 except ImportError:
     redis = None
+
+from helpers.tool_station_coords import (
+    compute_tool_station_calibration,
+    run_volume_visit_from_json,
+    visit_tool_volume_waypoints,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -73,9 +78,10 @@ SCAN_STATUS_PERIOD_S = 0.25
 SCAN_TIMEOUT_S = 30.0
 DEFAULT_PATH_LOG_DIR = DEMO_DAY_DIR / "path-logs"
 
-# Outputs consumed by demo-day/robot/visit_tool_volumes.py.
+# Outputs written for calibration / replay.
 DEFAULT_TOOL_STATION_MODEL_JSON = DEMO_DAY_DIR / "tool_station_model.json"
 DEFAULT_TOOL_STATION_OBSERVATION_JSON = DEMO_DAY_DIR / "tool_station_observation.json"
+DEFAULT_TOOL_STATION_WORLD_JSON = DEMO_DAY_DIR / "tool_station_world_positions.json"
 
 # Camera intrinsics file (same one used by demo-day/robot/calibrate_canvas.py).
 DEFAULT_CAMERA_INTRINSICS_JSON = SCRIPT_DIR / "camera_intrinsics.json"
@@ -871,7 +877,7 @@ def capture_tool_tag_observation(
         raise RuntimeError("`cv2` package is not installed.")
 
     try:
-        from model_tool_station import pick_reference_tag_id
+        from helpers.model_tool_station import pick_reference_tag_id
     except ImportError as exc:
         raise RuntimeError("Could not import model_tool_station") from exc
 
@@ -1009,7 +1015,7 @@ def save_tool_station_artifacts(
     Cartesian pose and writes the observation JSON.
     """
     try:
-        from model_tool_station import PaintToolStationModel
+        from helpers.model_tool_station import PaintToolStationModel
     except ImportError as exc:  # pragma: no cover - defensive
         print("Could not import model_tool_station:", exc)
         return 1
@@ -1378,8 +1384,7 @@ def parse_args() -> argparse.Namespace:
         "--tool-station-observation-json",
         default=str(DEFAULT_TOOL_STATION_OBSERVATION_JSON),
         help=(
-            "Where to save the runtime tag/EE snapshot used by "
-            "visit_tool_volumes.py "
+            "Where to save the runtime tag/EE snapshot "
             f"(default: {DEFAULT_TOOL_STATION_OBSERVATION_JSON})."
         ),
     )
@@ -1392,11 +1397,92 @@ def parse_args() -> argparse.Namespace:
             f"(default: {TOOL_OBSERVATION_FRAMES})."
         ),
     )
+    parser.add_argument(
+        "--world-json",
+        default=str(DEFAULT_TOOL_STATION_WORLD_JSON),
+        help=(
+            "Where to write computed world-frame volume waypoints "
+            f"(default: {DEFAULT_TOOL_STATION_WORLD_JSON})."
+        ),
+    )
+    parser.add_argument(
+        "--skip-volume-visit",
+        action="store_true",
+        help=(
+            "Only run INIT_POS -> TOOL_INIT and write calibration JSON;"
+            " do not visit P1/P2/P3/WATER."
+        ),
+    )
+    parser.add_argument(
+        "--volume-dwell-s",
+        type=float,
+        default=0.75,
+        help="Seconds to dwell at each volume waypoint (default: 0.75).",
+    )
+    parser.add_argument(
+        "--skip-final-scan-reference",
+        action="store_true",
+        help="After volume visit, stop at WATER_INIT instead of scan reference.",
+    )
+    parser.add_argument(
+        "--volume-timeout-s",
+        type=float,
+        default=30.0,
+        help="Per-waypoint Cartesian timeout in seconds (default: 30).",
+    )
+    parser.add_argument(
+        "--volumes-from-json",
+        action="store_true",
+        help=(
+            "Skip INIT_POS -> TOOL_INIT and the camera calibration; load existing "
+            "tool-station JSON and visit P1/P2/P3/WATER only."
+        ),
+    )
     return parser.parse_args()
+
+
+def visit_paint_and_water_inits(
+    redis_client,
+    *,
+    model_json_path: Path,
+    observation_json_path: Path,
+    world_json_path: Path,
+    volume_dwell_s: float,
+    skip_final_scan_reference: bool,
+    volume_timeout_s: float,
+) -> bool:
+    """Compute world-frame hover targets from calibration JSON and visit them."""
+    print("\nComputing world-frame volume waypoints from calibration JSON.")
+    calibration = compute_tool_station_calibration(
+        model_json_path=model_json_path,
+        observation_json_path=observation_json_path,
+        world_json_path=world_json_path,
+    )
+    print("\nVisiting P1_INIT -> P2_INIT -> P3_INIT -> WATER_INIT.")
+    return visit_tool_volume_waypoints(
+        redis_client,
+        calibration,
+        dwell_s=volume_dwell_s,
+        skip_final_scan_reference=skip_final_scan_reference,
+        timeout_per_waypoint_s=volume_timeout_s,
+        status_period_s=STATUS_PERIOD_S,
+    )
 
 
 def main() -> int:
     args = parse_args()
+
+    if args.volumes_from_json:
+        return run_volume_visit_from_json(
+            model_json_path=Path(args.tool_station_model_json),
+            observation_json_path=Path(args.tool_station_observation_json),
+            world_json_path=Path(args.world_json),
+            dwell_s=args.volume_dwell_s,
+            skip_final_scan_reference=args.skip_final_scan_reference,
+            timeout_per_waypoint_s=args.volume_timeout_s,
+            status_period_s=STATUS_PERIOD_S,
+        )
+
     cap = None
 
     try:
@@ -1437,6 +1523,18 @@ def main() -> int:
         )
         if artifact_result != 0:
             return artifact_result
+
+        if not args.skip_volume_visit:
+            if not visit_paint_and_water_inits(
+                redis_client,
+                model_json_path=Path(args.tool_station_model_json),
+                observation_json_path=Path(args.tool_station_observation_json),
+                world_json_path=Path(args.world_json),
+                volume_dwell_s=args.volume_dwell_s,
+                skip_final_scan_reference=args.skip_final_scan_reference,
+                volume_timeout_s=args.volume_timeout_s,
+            ):
+                return 1
 
         scan_result = scan_tool_tags(
             cap=cap,

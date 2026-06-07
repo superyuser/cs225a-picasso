@@ -4,8 +4,7 @@ The model describes the location of each tag and its associated cylindrical
 volume (paint cup or water cup) in a single "station" coordinate frame whose
 origin is the top-left corner of the tag with id 10. The model is
 self-contained -- it does not require a camera or any robot connection -- and
-can be exported as JSON so downstream scripts (e.g.
-demo-day/robot/visit_tool_volumes.py) can read its coordinates without
+can be exported as JSON so downstream scripts can read its coordinates without
 re-deriving them.
 
 Station-frame conventions:
@@ -80,7 +79,7 @@ class CylinderVolume:
 
 
 # Names exposed to downstream visit scripts. The list order is the order in
-# which they will be visited by demo-day/robot/visit_tool_volumes.py.
+# Visit order used by demo-day/robot/visit_tool_station.py after calibration.
 VOLUME_NAME_TO_INIT_LABEL = {
     "paint_1": "P1_INIT",
     "paint_2": "P2_INIT",
