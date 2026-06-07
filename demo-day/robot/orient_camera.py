@@ -46,6 +46,14 @@ POS_TOL_M = 1.0e-2
 DWELL_AFTER_TRANSLATION_S = 0.25
 ARC_STEP_M = 0.02
 ARC_SAGITTA_M = 0.12
+# Minimum XY arc radius enforced when constructing translation paths. Short
+# chord segments would otherwise produce a small radius (sharp curvature)
+# which makes the cartesian controller shake during execution. If the radius
+# implied by ARC_SAGITTA_M falls below this floor, the sagitta is shrunk just
+# enough to lift the radius back up to ARC_MIN_RADIUS_M (i.e. the arc becomes
+# flatter / smoother). Crank this up (e.g. 2.0+) to make paths effectively
+# straight when the cartesian controller is still shaky.
+ARC_MIN_RADIUS_M = 1.0
 LAST_JOINT_TARGET_DEG = 90.0
 JOINT_ARRIVAL_THRESHOLD = 8.0e-2
 JOINT_MAX_STEP_DEG = 0.5
@@ -192,6 +200,7 @@ def build_xy_arc_path(
     sagitta_m: float,
     step_m: float,
     side: str,
+    min_radius_m: float = 0.0,
 ) -> tuple[np.ndarray, float]:
     start_xy = np.array(start_pos[:2], dtype=float)
     target_xy = np.array(target_pos[:2], dtype=float)
@@ -207,6 +216,26 @@ def build_xy_arc_path(
 
     radius = chord_len**2 / (8.0 * sagitta) + sagitta / 2.0
     half_chord = chord_len / 2.0
+
+    # Enforce a floor on the XY arc radius so short-chord paths don't produce
+    # sharp curvature (which makes the cartesian controller shake). Radius is
+    # monotonically decreasing in sagitta on (0, c/2], so to raise the radius
+    # we shrink the sagitta. Solving c^2/(8 s) + s/2 = r_min for the smaller
+    # root gives s = r_min - sqrt(r_min^2 - (c/2)^2).
+    if min_radius_m > 0.0 and radius < min_radius_m:
+        if min_radius_m >= half_chord:
+            new_sagitta = min_radius_m - math.sqrt(
+                max(min_radius_m**2 - half_chord**2, 0.0)
+            )
+            new_sagitta = max(new_sagitta, 1.0e-4)
+            sagitta = min(new_sagitta, chord_len * 0.49)
+        else:
+            # Geometrically impossible (chord is longer than the diameter
+            # implied by min_radius_m). Pick the flattest arc we can: a
+            # tiny sagitta makes the path effectively straight.
+            sagitta = max(min(sagitta, 1.0e-3), 1.0e-4)
+        radius = chord_len**2 / (8.0 * sagitta) + sagitta / 2.0
+
     center_offset = math.sqrt(max(radius**2 - half_chord**2, 0.0))
 
     unit_chord = chord / chord_len
@@ -242,6 +271,7 @@ def build_translation_path(
     sagitta_m: float,
     step_m: float,
     arc_side: str,
+    min_radius_m: float = 0.0,
 ) -> tuple[np.ndarray, float, str]:
     if arc_side in ("left", "right"):
         path, radius = build_xy_arc_path(
@@ -250,6 +280,7 @@ def build_translation_path(
             sagitta_m=sagitta_m,
             step_m=step_m,
             side=arc_side,
+            min_radius_m=min_radius_m,
         )
         return path, radius, arc_side
 
@@ -259,6 +290,7 @@ def build_translation_path(
         sagitta_m=sagitta_m,
         step_m=step_m,
         side="left",
+        min_radius_m=min_radius_m,
     )
     right_path, right_radius = build_xy_arc_path(
         start_pos,
@@ -266,6 +298,7 @@ def build_translation_path(
         sagitta_m=sagitta_m,
         step_m=step_m,
         side="right",
+        min_radius_m=min_radius_m,
     )
 
     if min_xy_radius(left_path) >= min_xy_radius(right_path):
@@ -489,6 +522,7 @@ def move_to_camera_init(
     arc_sagitta_m: float = ARC_SAGITTA_M,
     arc_step_m: float = ARC_STEP_M,
     arc_side: str = "auto",
+    arc_min_radius_m: float = ARC_MIN_RADIUS_M,
     last_joint_target_deg: float = LAST_JOINT_TARGET_DEG,
     joint_arrival_threshold: float = JOINT_ARRIVAL_THRESHOLD,
     joint_max_step_deg: float = JOINT_MAX_STEP_DEG,
@@ -532,12 +566,14 @@ def move_to_camera_init(
             sagitta_m=arc_sagitta_m,
             step_m=arc_step_m,
             arc_side=arc_side,
+            min_radius_m=arc_min_radius_m,
         )
         path_index = 0
         translation_target = translation_path[path_index]
 
         print("Translation waypoints:", len(translation_path))
         print("XY arc radius (m):", arc_radius)
+        print("XY arc minimum radius enforced (m):", arc_min_radius_m)
         print("XY arc side:", chosen_arc_side)
         print("Minimum waypoint XY radius (m):", min_xy_radius(translation_path))
 
@@ -839,7 +875,7 @@ def move_to_camera_init(
 
             elif state == CameraState.RETURNING_LAST_JOINT:
                 current_joint_position = read_np(
-                    redis_client,
+                    redis_client,git add
                     redis_keys.sensor_joint_positions,
                     (7,),
                 )
@@ -886,6 +922,7 @@ def move_to_camera_init(
                         sagitta_m=arc_sagitta_m,
                         step_m=arc_step_m,
                         arc_side=arc_side,
+                        min_radius_m=arc_min_radius_m,
                     )
                     path_index = 0
                     translation_target = translation_path[path_index]
@@ -894,6 +931,7 @@ def move_to_camera_init(
                     print("Phase 5: returning along XY arc to INIT_POS.")
                     print("Return waypoints:", len(translation_path))
                     print("Return arc radius (m):", return_arc_radius)
+                    print("Return arc minimum radius enforced (m):", arc_min_radius_m)
                     print("Return arc side:", return_arc_side)
                     print("INIT_POS target:", INIT_POS)
 
@@ -1002,6 +1040,17 @@ def parse_args() -> argparse.Namespace:
         help="XY arc side from current position to target (default: auto).",
     )
     parser.add_argument(
+        "--arc-min-radius-m",
+        type=float,
+        default=ARC_MIN_RADIUS_M,
+        help=(
+            "Minimum XY arc radius in meters. If the radius implied by "
+            "--arc-sagitta-m falls below this floor (e.g. on short chords), "
+            "the sagitta is shrunk so the arc is flatter and the cartesian "
+            f"controller is less likely to shake (default: {ARC_MIN_RADIUS_M})."
+        ),
+    )
+    parser.add_argument(
         "--last-joint-target-deg",
         type=float,
         default=LAST_JOINT_TARGET_DEG,
@@ -1062,6 +1111,7 @@ def main() -> None:
         arc_sagitta_m=args.arc_sagitta_m,
         arc_step_m=args.arc_step_m,
         arc_side=args.arc_side,
+        arc_min_radius_m=args.arc_min_radius_m,
         last_joint_target_deg=args.last_joint_target_deg,
         joint_arrival_threshold=args.joint_arrival_threshold,
         joint_max_step_deg=args.joint_max_step_deg,
