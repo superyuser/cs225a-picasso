@@ -67,8 +67,18 @@ FACE_DETECTION_MIN_SIZE = (60, 60)
 CAMERA_INIT_POS_MM = np.array([-310.22, 592.11, 340.43], dtype=float)
 CAMERA_INIT_POS_M = CAMERA_INIT_POS_MM / 1000.0
 
-# Robot "home" pose to return to after the centered capture is taken.
-INIT_POS = np.array([0.54671, 0.11226, 0.33151], dtype=float)
+# Robot "home" pose to return to after the centered capture is taken. Sourced
+# from demo-day/config.json so all demo-day scripts share one source of truth.
+_DEMO_DAY_CONFIG_PATH = DEMO_DAY_DIR / "config.json"
+
+
+def _load_init_pos() -> np.ndarray:
+    with _DEMO_DAY_CONFIG_PATH.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return np.array(cfg["init_pos_m"], dtype=float)
+
+
+INIT_POS = _load_init_pos()
 
 
 class CameraState(Enum):

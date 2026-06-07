@@ -57,8 +57,19 @@ DT = 0.01                            # 100 Hz main loop
 POS_TOL_M = 1.0e-2                   # 10 mm position tolerance
 DWELL_AT_INIT_S = 0.5
 
-# INIT position from the existing robot calibration.
-INIT_POS = np.array([0.54671, 0.11226, 0.33151], dtype=float)
+# Robot "home" pose is sourced from demo-day/config.json so all demo-day
+# scripts share a single source of truth.
+_SCRIPT_DIR_FOR_INIT = Path(__file__).resolve().parent
+_DEMO_DAY_CONFIG_PATH = _SCRIPT_DIR_FOR_INIT.parent / "config.json"
+
+
+def _load_init_pos() -> np.ndarray:
+    with _DEMO_DAY_CONFIG_PATH.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return np.array(cfg["init_pos_m"], dtype=float)
+
+
+INIT_POS = _load_init_pos()
 
 
 @dataclass
@@ -68,6 +79,9 @@ class RedisKeys:
     )
     cartesian_task_current_position: str = (
         f"opensai::controllers::{ROBOT_NAME}::cartesian_controller::cartesian_task::current_position"
+    )
+    cartesian_task_current_orientation: str = (
+        f"opensai::controllers::{ROBOT_NAME}::cartesian_controller::cartesian_task::current_orientation"
     )
     active_controller: str = f"opensai::controllers::{ROBOT_NAME}::active_controller_name"
     config_file_name: str = "::sai-interfaces-webui::config_file_name"
@@ -112,7 +126,7 @@ def position_error(current_pos, goal_pos):
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEMO_DAY_DIR = SCRIPT_DIR.parent
-DEFAULT_OUTPUT_JSON = DEMO_DAY_DIR / "robot" / "canvas_corners_from_camera.json"
+DEFAULT_OUTPUT_JSON = DEMO_DAY_DIR / "canvas_corners.json"
 DEFAULT_INTRINSICS_JSON = DEMO_DAY_DIR / "robot" / "camera_intrinsics.json"
 
 DEFAULT_CAMERA_INDEX = 0
@@ -434,9 +448,17 @@ def capture_corners(
 # OUTPUT
 # ============================================================
 
-def build_output_payload(capture_result, robot_pos_at_capture):
+def build_output_payload(capture_result, robot_pos_at_capture, robot_ori_at_capture):
     cam_corners = capture_result["corners_in_camera_frame_m"]
     tip_corners = {name: camera_to_tip(p) for name, p in cam_corners.items()}
+
+    # World-frame corner positions: the tip is assumed to sit at INIT_POS when
+    # calibration runs, with tip-frame axes aligned to the world frame. Then
+    # the world position of each canvas corner is simply:
+    #   corner_world = INIT_POS + corner_in_tip_frame
+    world_corners = {
+        name: INIT_POS + tip_corners[name] for name in CORNER_ORDER
+    }
 
     payload = {
         "units": "meters",
@@ -453,12 +475,19 @@ def build_output_payload(capture_result, robot_pos_at_capture):
         "robot_position_at_capture_m": (
             robot_pos_at_capture.tolist() if robot_pos_at_capture is not None else None
         ),
+        "robot_orientation_at_capture": (
+            robot_ori_at_capture.tolist() if robot_ori_at_capture is not None else None
+        ),
         "corners_in_camera_frame_m": {
             name: [round(float(v), 5) for v in cam_corners[name]]
             for name in CORNER_ORDER
         },
         "corners_in_tip_frame_m": {
             name: [round(float(v), 5) for v in tip_corners[name]]
+            for name in CORNER_ORDER
+        },
+        "corners_in_world_frame_m": {
+            name: [round(float(v), 5) for v in world_corners[name]]
             for name in CORNER_ORDER
         },
         "tip_to_corner_distance_m": {
@@ -480,10 +509,20 @@ def print_summary(payload):
     print()
     print(f"{'corner':<6} {'X (mm)':>10} {'Y (mm)':>10} {'Z (mm)':>10}   {'dist (mm)':>10}")
     print("-" * 60)
+    print("Tip-frame offsets (corner relative to brush tip):")
     for name in CORNER_ORDER:
         tip = payload["corners_in_tip_frame_m"][name]
         dist = payload["tip_to_corner_distance_m"][name]
         print(f"{name:<6} {tip[0]*1000:>10.2f} {tip[1]*1000:>10.2f} {tip[2]*1000:>10.2f}   {dist*1000:>10.2f}")
+    world = payload.get("corners_in_world_frame_m")
+    if world is not None:
+        print()
+        print("World-frame positions (robot base frame, meters):")
+        print(f"{'corner':<6} {'X (m)':>10} {'Y (m)':>10} {'Z (m)':>10}")
+        print("-" * 60)
+        for name in CORNER_ORDER:
+            w = world[name]
+            print(f"{name:<6} {w[0]:>10.4f} {w[1]:>10.4f} {w[2]:>10.4f}")
     print()
 
 
@@ -520,6 +559,7 @@ def main() -> int:
           f"{(CAMERA_OFFSET_IN_TIP_FRAME_M * 1000).tolist()}")
 
     robot_pos = None
+    robot_ori = None
 
     if not args.no_move:
         if redis is None:
@@ -531,6 +571,8 @@ def main() -> int:
         if not move_to_init(redis_client, dwell_s=args.dwell_s):
             return 1
         robot_pos = read_np(redis_client, redis_keys.cartesian_task_current_position, (3,))
+        robot_ori = read_np(redis_client, redis_keys.cartesian_task_current_orientation, (3, 3))
+        print(f"Robot orientation at capture:\n{robot_ori}")
     else:
         print("--no-move: skipping robot motion.")
 
@@ -542,7 +584,7 @@ def main() -> int:
     if result is None:
         return 1
 
-    payload = build_output_payload(result, robot_pos)
+    payload = build_output_payload(result, robot_pos, robot_ori)
 
     out_path = Path(args.output_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
