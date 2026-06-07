@@ -1,5 +1,9 @@
 {
   "units": "meters",
   "init_pos_m": [0.40, 0.11226, 0.3151],
-  "canvas_corner_x_offset_m": -0.025
+  "canvas_corner_x_offset_m": -0.025,
+  "TOOL_INIT": [34.96, -74.35, 110.53, 99.86, 0.50, 48.48, 115.66],
+  "TOOL_SAFE_APPROACH": [14.44, -54.19, 45.64, 94.07, 0.21, 43.50, 57.76],
+  "TOOL_SAFE_APPROACH_2": [27.57, -67.09, 87.16, 97.78, 0.39, 46.69, 91.21]
+  
 }
