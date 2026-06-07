@@ -2,9 +2,10 @@
 
 Flow:
     INIT_POS (Cartesian) -> TOOL_SAFE_APPROACH -> TOOL_SAFE_APPROACH_2 -> TOOL_INIT
-    then joint-space visits:
-        P1_CENTER -> TOOL_INIT -> P2_CENTER -> TOOL_INIT -> P3_CENTER -> TOOL_INIT
-        -> WATER_CENTER -> TOOL_INIT -> NAPKIN_TOP_POINT -> NAPKIN_BOTTOM_POINT -> TOOL_INIT
+    then Cartesian paint dips:
+        P1_INIT_POS -> dip -> P2_INIT_POS -> dip -> P3_INIT_POS -> dip
+
+Each dip is hover -> hover + z_dive_in_offset -> hover (see helpers/primitives.py).
 
 Usage:
     python robot/visit_tool_station.py
@@ -24,6 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from typing import Callable
+
 import numpy as np
 
 try:
@@ -35,6 +38,14 @@ try:
     import redis
 except ImportError:
     redis = None
+
+from helpers.primitives import (
+    dip_paint_1,
+    dip_paint_2,
+    dip_paint_3,
+    load_paint_init_pos_m,
+    load_z_dive_in_offset_m,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -53,8 +64,10 @@ DWELL_AT_INIT_POS_S = 0.25
 JOINT_ARRIVAL_THRESHOLD = 0.25
 JOINT_MAX_STEP_DEG = 0.5
 JOINT_CONTROLLER_SETTLE_S = 0.25
+CARTESIAN_SETTLE_S = 0.25
 DWELL_AT_TOOL_INIT_S = 0.5
-DWELL_AT_STATION_POINT_S = 0.5
+DWELL_AT_PAINT_HOVER_S = 0.25
+DWELL_AT_PAINT_DIP_S = 0.5
 STATUS_PERIOD_S = 0.25
 TIMEOUT_S = 60.0
 
@@ -156,20 +169,6 @@ def load_tool_waypoints_deg() -> list[tuple[str, np.ndarray]]:
         (name, load_joint_waypoint_deg(cfg, name))
         for name in waypoint_names
     ]
-
-
-# Station visits after TOOL_INIT: (config key, return_to_tool_init_after).
-STATION_VISIT_SEQUENCE: list[tuple[str, bool]] = [
-    ("P1_CENTER", True),
-    ("P2_CENTER", True),
-    ("P3_CENTER", True),
-    ("WATER_CENTER", True),
-]
-
-NAPKIN_VISIT_SEQUENCE: list[str] = [
-    "NAPKIN_TOP_POINT",
-    "NAPKIN_BOTTOM_POINT",
-]
 
 
 def decode_redis_value(val):
@@ -1196,87 +1195,132 @@ def follow_joint_path_to_goal(
         time.sleep(DT)
 
 
-def run_tool_station_visits(
+def make_cartesian_move_fn(
+    *,
+    pos_tol_m: float,
+    path_trace: list[PathTraceSample] | None = None,
+    trace_start: float | None = None,
+):
+    def move_fn(
+        redis_client,
+        *,
+        target_pos: np.ndarray,
+        hold_orientation: np.ndarray,
+        label: str,
+        dwell_s: float,
+        timeout_s: float,
+        status_period_s: float,
+    ) -> bool:
+        start = time.perf_counter()
+        ok = move_cartesian_to_target(
+            redis_client,
+            target_position=target_pos,
+            hold_orientation=hold_orientation,
+            label=label,
+            pos_tol_m=pos_tol_m,
+            status_period_s=status_period_s,
+            timeout_s=timeout_s,
+            start_time=start,
+            path_trace=path_trace,
+            trace_start=trace_start,
+        )
+        if ok and dwell_s > 0.0:
+            time.sleep(dwell_s)
+        return ok
+
+    return move_fn
+
+
+def run_paint_dip_sequence(
     redis_client,
     *,
-    tool_init_rad: np.ndarray,
-    max_joint_step: float,
-    joint_arrival_threshold: float,
-    station_dwell_s: float = DWELL_AT_STATION_POINT_S,
+    pos_tol_m: float = POS_TOL_M,
+    hover_dwell_s: float = DWELL_AT_PAINT_HOVER_S,
+    dip_dwell_s: float = DWELL_AT_PAINT_DIP_S,
     status_period_s: float = STATUS_PERIOD_S,
     timeout_s: float = TIMEOUT_S,
     path_trace: list[PathTraceSample] | None = None,
     trace_start: float | None = None,
 ) -> bool:
     cfg = load_demo_day_config()
-
-    for name, return_home in STATION_VISIT_SEQUENCE:
-        target_rad = load_joint_waypoint_deg(cfg, name) * DEG_TO_RAD
-        current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
-        if not follow_joint_path_to_goal(
-            redis_client,
-            start_joint_position=current,
-            goal_joint_position=target_rad,
-            label=name,
-            max_joint_step=max_joint_step,
-            joint_arrival_threshold=joint_arrival_threshold,
-            dwell_s=station_dwell_s,
-            status_period_s=status_period_s,
-            timeout_s=timeout_s,
-            path_trace=path_trace,
-            trace_start=trace_start,
-        ):
-            return False
-
-        if return_home:
-            current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
-            if not follow_joint_path_to_goal(
-                redis_client,
-                start_joint_position=current,
-                goal_joint_position=tool_init_rad,
-                label="TOOL_INIT",
-                max_joint_step=max_joint_step,
-                joint_arrival_threshold=joint_arrival_threshold,
-                dwell_s=station_dwell_s,
-                status_period_s=status_period_s,
-                timeout_s=timeout_s,
-                path_trace=path_trace,
-                trace_start=trace_start,
-            ):
-                return False
-
-    for name in NAPKIN_VISIT_SEQUENCE:
-        target_rad = load_joint_waypoint_deg(cfg, name) * DEG_TO_RAD
-        current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
-        if not follow_joint_path_to_goal(
-            redis_client,
-            start_joint_position=current,
-            goal_joint_position=target_rad,
-            label=name,
-            max_joint_step=max_joint_step,
-            joint_arrival_threshold=joint_arrival_threshold,
-            dwell_s=station_dwell_s,
-            status_period_s=status_period_s,
-            timeout_s=timeout_s,
-            path_trace=path_trace,
-            trace_start=trace_start,
-        ):
-            return False
-
-    current = read_np(redis_client, redis_keys.sensor_joint_positions, (7,))
-    return follow_joint_path_to_goal(
+    hold_orientation = read_np(
         redis_client,
-        start_joint_position=current,
-        goal_joint_position=tool_init_rad,
-        label="TOOL_INIT",
-        max_joint_step=max_joint_step,
-        joint_arrival_threshold=joint_arrival_threshold,
-        dwell_s=station_dwell_s,
-        status_period_s=status_period_s,
-        timeout_s=timeout_s,
+        redis_keys.cartesian_task_current_orientation,
+        (3, 3),
+    )
+    current_position = read_np(
+        redis_client,
+        redis_keys.cartesian_task_current_position,
+        (3,),
+    )
+
+    print("Switching to Cartesian controller for paint-station visits.")
+    print("Holding current Cartesian orientation throughout.")
+    print("Current Cartesian position:", np.round(current_position, 5))
+    print(
+        "z_dive_in_offset (mm):",
+        round(load_z_dive_in_offset_m(cfg) * 1000.0, 3),
+    )
+
+    set_cartesian_goal(redis_client, current_position, hold_orientation)
+    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
+    print("Using controller:", CARTESIAN_CONTROLLER)
+
+    settle_start = time.perf_counter()
+    while time.perf_counter() - settle_start < CARTESIAN_SETTLE_S:
+        set_cartesian_goal(redis_client, current_position, hold_orientation)
+        time.sleep(DT)
+
+    move_fn = make_cartesian_move_fn(
+        pos_tol_m=pos_tol_m,
         path_trace=path_trace,
         trace_start=trace_start,
     )
+    sequence_start = time.perf_counter()
+
+    paint_legs: list[tuple[str, np.ndarray, Callable[..., bool]]] = [
+        ("P1_INIT_POS", load_paint_init_pos_m(cfg, "P1_INIT_POS"), dip_paint_1),
+        ("P2_INIT_POS", load_paint_init_pos_m(cfg, "P2_INIT_POS"), dip_paint_2),
+        ("P3_INIT_POS", load_paint_init_pos_m(cfg, "P3_INIT_POS"), dip_paint_3),
+    ]
+
+    print("\nPaint-station Cartesian sequence:")
+    for label, target_pos, _dip_fn in paint_legs:
+        print(f"  {label}: {np.round(target_pos, 5).tolist()} m")
+
+    for label, target_pos, dip_fn in paint_legs:
+        if not move_cartesian_to_target(
+            redis_client,
+            target_position=target_pos,
+            hold_orientation=hold_orientation,
+            label=label,
+            pos_tol_m=pos_tol_m,
+            status_period_s=status_period_s,
+            timeout_s=timeout_s,
+            start_time=sequence_start,
+            path_trace=path_trace,
+            trace_start=trace_start,
+        ):
+            return False
+
+        print(f"Reached {label}.")
+        if hover_dwell_s > 0.0:
+            time.sleep(hover_dwell_s)
+
+        if not dip_fn(
+            redis_client,
+            hold_orientation=hold_orientation,
+            config=cfg,
+            dwell_at_dip_s=dip_dwell_s,
+            dwell_at_hover_s=hover_dwell_s,
+            timeout_s=timeout_s,
+            status_period_s=status_period_s,
+            move_fn=move_fn,
+        ):
+            return False
+
+    print("\nFinished paint-station dip sequence.")
+    return True
 
 
 def move_to_tool_init(
@@ -1458,11 +1502,8 @@ def move_to_tool_init(
             if dwell_s > 0.0:
                 time.sleep(dwell_s)
 
-            if not run_tool_station_visits(
+            if not run_paint_dip_sequence(
                 redis_client,
-                tool_init_rad=joint_goal,
-                max_joint_step=max_joint_step,
-                joint_arrival_threshold=joint_arrival_threshold,
                 status_period_s=status_period_s,
                 timeout_s=timeout_s,
                 path_trace=path_trace,
