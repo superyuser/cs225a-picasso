@@ -3,6 +3,7 @@
 from .model_tool_station import PaintToolStationModel, pick_reference_tag_id
 from .tool_station_coords import (
     ToolStationCalibration,
+    approach_tool_init_cartesian,
     compute_tool_station_calibration,
     run_volume_visit_from_json,
     visit_tool_volume_waypoints,
@@ -30,6 +31,7 @@ __all__ = [
     "PaintChangeStep",
     "PaintChangeStepKind",
     "approach_tool_init",
+    "approach_tool_init_cartesian",
     "build_paint_change_sequence",
     "compute_tool_station_calibration",
     "dip_paint_1",

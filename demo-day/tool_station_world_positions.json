@@ -1,0 +1,87 @@
+{
+  "captured_at": "2026-06-07T14:47:36",
+  "frame": "world (robot base) frame",
+  "units": "meters",
+  "scan_reference_position_world_m": [
+    0.4005429999999999,
+    0.11204199999999999,
+    0.315029
+  ],
+  "hold_orientation_world": [
+    [
+      -0.9999182735275588,
+      -0.001739055261302573,
+      -0.012665778794214148
+    ],
+    [
+      -0.0016989450723572063,
+      0.9999935104652352,
+      -0.003176887321904292
+    ],
+    [
+      0.012671221381814111,
+      -0.003155109223640507,
+      -0.9999147390825274
+    ]
+  ],
+  "observation_json_path": "/home/src1/cs225a-picasso/demo-day/tool_station_observation.json",
+  "model_json_path": "/home/src1/cs225a-picasso/demo-day/tool_station_model.json",
+  "waypoints": [
+    {
+      "label": "P1_INIT",
+      "volume_name": "paint_1",
+      "world_position_m": [
+        0.08400268703159053,
+        0.15620550451763462,
+        0.3258470008951436
+      ],
+      "station_position_mm": [
+        -17.5,
+        65.0,
+        50.0
+      ]
+    },
+    {
+      "label": "P2_INIT",
+      "volume_name": "paint_2",
+      "world_position_m": [
+        0.10456872449374521,
+        0.16006428797104544,
+        0.382079979594168
+      ],
+      "station_position_mm": [
+        -77.5,
+        65.0,
+        50.0
+      ]
+    },
+    {
+      "label": "P3_INIT",
+      "volume_name": "paint_3",
+      "world_position_m": [
+        0.1251347619558999,
+        0.16392307142445622,
+        0.4383129582931924
+      ],
+      "station_position_mm": [
+        -137.5,
+        65.0,
+        50.0
+      ]
+    },
+    {
+      "label": "WATER_INIT",
+      "volume_name": "water",
+      "world_position_m": [
+        0.15375962687298825,
+        0.18645015217655408,
+        0.5116573360004638
+      ],
+      "station_position_mm": [
+        -217.5,
+        82.5,
+        50.0
+      ]
+    }
+  ]
+}

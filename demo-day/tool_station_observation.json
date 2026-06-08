@@ -1,0 +1,92 @@
+{
+  "captured_at": "2026-06-07T14:47:36",
+  "robot_name": "Titania",
+  "tag_family": "tag36h11",
+  "tag_size_m": 0.035,
+  "tool_tag_ids": [
+    10,
+    11,
+    12,
+    13
+  ],
+  "reference_tag_id": 10,
+  "visible_tag_ids": [
+    10,
+    11
+  ],
+  "snapshot_num_frames": 12,
+  "note": "ee_position_world_m and ee_orientation_world are the Redis Cartesian pose averaged over the same frames as the tag scan. reference_tag_id is the detected tag used to anchor the station frame (prefer 10, else first visible in 10/11/12/13 order).",
+  "ee_position_world_m": [
+    0.4005429999999999,
+    0.11204199999999999,
+    0.315029
+  ],
+  "ee_orientation_world": [
+    [
+      -0.9999182735275588,
+      -0.001739055261302573,
+      -0.012665778794214148
+    ],
+    [
+      -0.0016989450723572063,
+      0.9999935104652352,
+      -0.003176887321904292
+    ],
+    [
+      0.012671221381814111,
+      -0.003155109223640507,
+      -0.9999147390825274
+    ]
+  ],
+  "camera_offset_in_tip_frame_m": [
+    -0.0756,
+    0.0,
+    0.04211
+  ],
+  "R_camera_to_tip": [
+    [
+      0.0,
+      0.0,
+      1.0
+    ],
+    [
+      -1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      -1.0,
+      0.0
+    ]
+  ],
+  "tag_poses_in_camera_frame": {
+    "10": {
+      "tvec": [
+        -0.002342,
+        0.069521,
+        0.442625
+      ],
+      "rvec": [
+        1.92452,
+        2.07951,
+        -0.251427
+      ],
+      "num_frames": 12
+    },
+    "11": {
+      "tvec": [
+        -0.005173,
+        0.127197,
+        0.417809
+      ],
+      "rvec": [
+        -0.101467,
+        1.951474,
+        -0.226632
+      ],
+      "num_frames": 12
+    }
+  },
+  "model_json_path": "/home/src1/cs225a-picasso/demo-day/tool_station_model.json"
+}

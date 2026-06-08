@@ -7,6 +7,7 @@ and Cartesian volume visits.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,6 +32,7 @@ except ImportError:
 HELPERS_DIR = Path(__file__).resolve().parent
 ROBOT_DIR = HELPERS_DIR.parent
 DEMO_DAY_DIR = ROBOT_DIR.parent
+DEMO_DAY_CONFIG_PATH = DEMO_DAY_DIR / "config.json"
 
 DEFAULT_TOOL_STATION_MODEL_JSON = DEMO_DAY_DIR / "tool_station_model.json"
 DEFAULT_TOOL_STATION_OBSERVATION_JSON = DEMO_DAY_DIR / "tool_station_observation.json"
@@ -41,12 +43,20 @@ CONFIG_FILE_FOR_THIS_SCRIPT = "basket.xml"
 CARTESIAN_CONTROLLER = "cartesian_controller"
 
 DT = 0.01
+MM_TO_M = 1.0e-3
+DEG_TO_RAD = math.pi / 180.0
 POS_TOL_M = 1.0e-2
+ORI_TOL_RAD = 5.0e-2
 DWELL_AT_WAYPOINT_S = 0.75
 INTER_GOAL_REFRESH_S = 0.05
 TIMEOUT_PER_WAYPOINT_S = 30.0
 STATUS_PERIOD_S = 0.25
 CARTESIAN_SETTLE_S = 0.25
+CARTESIAN_MAX_STEP_M = 0.002
+CARTESIAN_MAX_ORI_STEP_RAD = 0.01
+TOOL_ARC_SAGITTA_M = 0.25
+TOOL_ARC_MIN_RADIUS_M = 1.6
+TOOL_ARC_SIDE = "auto"
 
 
 @dataclass
@@ -76,6 +86,13 @@ class VolumeWaypoint:
     world_position_m: np.ndarray
     station_position_mm: np.ndarray | None
     volume_name: str | None
+
+
+@dataclass
+class CartesianPoseWaypoint:
+    label: str
+    position_m: np.ndarray
+    orientation: np.ndarray
 
 
 @dataclass
@@ -112,6 +129,11 @@ def read_np(redis_client, key, expected_shape):
             except Exception:
                 pass
         time.sleep(0.01)
+
+
+def load_demo_day_config() -> dict[str, Any]:
+    with DEMO_DAY_CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def set_cartesian_goal(redis_client, position, orientation):
@@ -157,6 +179,270 @@ def position_error(current_pos, goal_pos) -> float:
     )
 
 
+def rotation_error_rad(current_orientation: np.ndarray, goal_orientation: np.ndarray) -> float:
+    relative_rotation = np.asarray(goal_orientation, dtype=float).T @ np.asarray(
+        current_orientation,
+        dtype=float,
+    )
+    cos_angle = (float(np.trace(relative_rotation)) - 1.0) * 0.5
+    return float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+
+
+def rpy_deg_to_matrix(rpy_deg: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = np.asarray(rpy_deg, dtype=float) * DEG_TO_RAD
+    cr, sr = math.cos(float(roll)), math.sin(float(roll))
+    cp, sp = math.cos(float(pitch)), math.sin(float(pitch))
+    cy, sy = math.cos(float(yaw)), math.sin(float(yaw))
+
+    rx = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]],
+        dtype=float,
+    )
+    ry = np.array(
+        [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]],
+        dtype=float,
+    )
+    rz = np.array(
+        [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    return rz @ ry @ rx
+
+
+def matrix_to_quat(rotation: np.ndarray) -> np.ndarray:
+    r = np.asarray(rotation, dtype=float)
+    trace = float(np.trace(r))
+
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (r[2, 1] - r[1, 2]) / s
+        qy = (r[0, 2] - r[2, 0]) / s
+        qz = (r[1, 0] - r[0, 1]) / s
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2.0
+        qw = (r[2, 1] - r[1, 2]) / s
+        qx = 0.25 * s
+        qy = (r[0, 1] + r[1, 0]) / s
+        qz = (r[0, 2] + r[2, 0]) / s
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2.0
+        qw = (r[0, 2] - r[2, 0]) / s
+        qx = (r[0, 1] + r[1, 0]) / s
+        qy = 0.25 * s
+        qz = (r[1, 2] + r[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2.0
+        qw = (r[1, 0] - r[0, 1]) / s
+        qx = (r[0, 2] + r[2, 0]) / s
+        qy = (r[1, 2] + r[2, 1]) / s
+        qz = 0.25 * s
+
+    quat = np.array([qw, qx, qy, qz], dtype=float)
+    return quat / max(float(np.linalg.norm(quat)), 1.0e-12)
+
+
+def quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    qw, qx, qy, qz = np.asarray(quat, dtype=float)
+    return np.array(
+        [
+            [
+                1.0 - 2.0 * (qy * qy + qz * qz),
+                2.0 * (qx * qy - qz * qw),
+                2.0 * (qx * qz + qy * qw),
+            ],
+            [
+                2.0 * (qx * qy + qz * qw),
+                1.0 - 2.0 * (qx * qx + qz * qz),
+                2.0 * (qy * qz - qx * qw),
+            ],
+            [
+                2.0 * (qx * qz - qy * qw),
+                2.0 * (qy * qz + qx * qw),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+        ],
+        dtype=float,
+    )
+
+
+def slerp_orientation(start: np.ndarray, target: np.ndarray, fraction: float) -> np.ndarray:
+    q0 = matrix_to_quat(start)
+    q1 = matrix_to_quat(target)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+    if dot > 0.9995:
+        quat = q0 + fraction * (q1 - q0)
+        quat = quat / max(float(np.linalg.norm(quat)), 1.0e-12)
+        return quat_to_matrix(quat)
+
+    theta_0 = math.acos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = math.sin(theta_0)
+    theta = theta_0 * fraction
+    scale_0 = math.sin(theta_0 - theta) / sin_theta_0
+    scale_1 = math.sin(theta) / sin_theta_0
+    return quat_to_matrix(scale_0 * q0 + scale_1 * q1)
+
+
+def load_init_pos_m(config: dict[str, Any] | None = None) -> np.ndarray:
+    cfg = config or load_demo_day_config()
+    init_pos = np.array(cfg["init_pos_m"], dtype=float)
+    if init_pos.shape != (3,):
+        raise RuntimeError(f"{DEMO_DAY_CONFIG_PATH} init_pos_m must contain 3 values.")
+    return init_pos
+
+
+def load_cartesian_tool_waypoints(
+    config: dict[str, Any] | None = None,
+) -> list[CartesianPoseWaypoint]:
+    cfg = config or load_demo_day_config()
+    waypoint_specs = [
+        ("TOOL_WP1", "TOOL_WP1_POS", "TOOL_WP1_ORI"),
+        ("TOOL_WP2", "TOOL_WP2_POS", "TOOL_WP2_ORI"),
+        ("TOOL_INIT", "TOOL_INIT_POS", "TOOL_INIT_ORI"),
+    ]
+
+    waypoints: list[CartesianPoseWaypoint] = []
+    for label, pos_key, ori_key in waypoint_specs:
+        if pos_key not in cfg or ori_key not in cfg:
+            raise RuntimeError(
+                f"{DEMO_DAY_CONFIG_PATH} is missing {pos_key} or {ori_key}."
+            )
+
+        position_mm = np.array(cfg[pos_key], dtype=float)
+        orientation_deg = np.array(cfg[ori_key], dtype=float)
+        if position_mm.shape != (3,):
+            raise RuntimeError(f"{DEMO_DAY_CONFIG_PATH} {pos_key} must contain 3 values.")
+        if orientation_deg.shape != (3,):
+            raise RuntimeError(f"{DEMO_DAY_CONFIG_PATH} {ori_key} must contain 3 values.")
+
+        waypoints.append(
+            CartesianPoseWaypoint(
+                label=label,
+                position_m=position_mm * MM_TO_M,
+                orientation=rpy_deg_to_matrix(orientation_deg),
+            )
+        )
+
+    return waypoints
+
+
+def min_xy_radius(points: np.ndarray) -> float:
+    if len(points) == 0:
+        return math.inf
+    return float(np.min(np.linalg.norm(points[:, :2], axis=1)))
+
+
+def build_xy_arc_path(
+    start_pos: np.ndarray,
+    target_pos: np.ndarray,
+    *,
+    sagitta_m: float,
+    step_m: float,
+    side: str,
+    min_radius_m: float = 0.0,
+) -> tuple[np.ndarray, float]:
+    start_xy = np.array(start_pos[:2], dtype=float)
+    target_xy = np.array(target_pos[:2], dtype=float)
+    chord = target_xy - start_xy
+    chord_len = float(np.linalg.norm(chord))
+
+    if chord_len < 1.0e-6:
+        return np.array([target_pos], dtype=float), math.inf
+
+    sagitta = max(abs(sagitta_m), 1.0e-4)
+    sagitta = min(sagitta, chord_len * 0.49)
+    step_m = max(abs(step_m), 1.0e-4)
+
+    radius = chord_len**2 / (8.0 * sagitta) + sagitta / 2.0
+    half_chord = chord_len / 2.0
+
+    # Match orient_camera.py: if the requested sagitta would create a sharp
+    # small-radius arc, shrink the sagitta until the arc is flatter.
+    if min_radius_m > 0.0 and radius < min_radius_m:
+        if min_radius_m >= half_chord:
+            new_sagitta = min_radius_m - math.sqrt(
+                max(min_radius_m**2 - half_chord**2, 0.0)
+            )
+            sagitta = min(max(new_sagitta, 1.0e-4), chord_len * 0.49)
+        else:
+            sagitta = max(min(sagitta, 1.0e-3), 1.0e-4)
+        radius = chord_len**2 / (8.0 * sagitta) + sagitta / 2.0
+
+    center_offset = math.sqrt(max(radius**2 - half_chord**2, 0.0))
+    unit_chord = chord / chord_len
+    left_normal = np.array([-unit_chord[1], unit_chord[0]], dtype=float)
+    bulge_normal = left_normal if side == "left" else -left_normal
+    center = (start_xy + target_xy) / 2.0 - bulge_normal * center_offset
+
+    start_angle = math.atan2(start_xy[1] - center[1], start_xy[0] - center[0])
+    target_angle = math.atan2(target_xy[1] - center[1], target_xy[0] - center[0])
+    angle_delta = (target_angle - start_angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    arc_length = abs(angle_delta) * radius
+    num_segments = max(1, int(math.ceil(arc_length / step_m)))
+
+    samples = []
+    for index in range(1, num_segments + 1):
+        fraction = index / num_segments
+        theta = start_angle + angle_delta * fraction
+        xy = center + radius * np.array(
+            [math.cos(theta), math.sin(theta)],
+            dtype=float,
+        )
+        z = start_pos[2] + (target_pos[2] - start_pos[2]) * fraction
+        samples.append(np.array([xy[0], xy[1], z], dtype=float))
+
+    samples[-1] = np.array(target_pos, dtype=float)
+    return np.array(samples, dtype=float), radius
+
+
+def build_tool_translation_path(
+    start_pos: np.ndarray,
+    target_pos: np.ndarray,
+    *,
+    sagitta_m: float,
+    step_m: float,
+    arc_side: str,
+    min_radius_m: float,
+) -> tuple[np.ndarray, float, str]:
+    if arc_side in ("left", "right"):
+        path, radius = build_xy_arc_path(
+            start_pos,
+            target_pos,
+            sagitta_m=sagitta_m,
+            step_m=step_m,
+            side=arc_side,
+            min_radius_m=min_radius_m,
+        )
+        return path, radius, arc_side
+
+    left_path, left_radius = build_xy_arc_path(
+        start_pos,
+        target_pos,
+        sagitta_m=sagitta_m,
+        step_m=step_m,
+        side="left",
+        min_radius_m=min_radius_m,
+    )
+    right_path, right_radius = build_xy_arc_path(
+        start_pos,
+        target_pos,
+        sagitta_m=sagitta_m,
+        step_m=step_m,
+        side="right",
+        min_radius_m=min_radius_m,
+    )
+
+    if min_xy_radius(left_path) >= min_xy_radius(right_path):
+        return left_path, left_radius, "left"
+    return right_path, right_radius, "right"
+
+
 def read_cartesian_pose(redis_client) -> tuple[np.ndarray, np.ndarray]:
     position = read_np(
         redis_client,
@@ -193,24 +479,242 @@ def switch_to_cartesian_hold_current(
     *,
     settle_s: float = CARTESIAN_SETTLE_S,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Activate cartesian control while tracking the measured EE pose."""
-    current_position, hold_orientation = read_cartesian_pose(redis_client)
+    """Activate Cartesian control while holding the measured EE orientation."""
+    current_position, current_orientation = read_cartesian_pose(redis_client)
+    locked_orientation = current_orientation.copy()
 
     print("Switching to Cartesian controller at measured pose.")
     print("Current Cartesian position:", np.round(current_position, 5))
-    print("Holding current Cartesian orientation.")
+    print("Locking current Cartesian orientation.")
 
-    set_cartesian_goal(redis_client, current_position, hold_orientation)
+    set_cartesian_goal(redis_client, current_position, locked_orientation)
     set_active_controller(redis_client, CARTESIAN_CONTROLLER)
     print("Using controller:", CARTESIAN_CONTROLLER)
 
     settle_start = time.perf_counter()
     while time.perf_counter() - settle_start < settle_s:
-        current_position, hold_orientation = read_cartesian_pose(redis_client)
-        set_cartesian_goal(redis_client, current_position, hold_orientation)
+        current_position = read_np(
+            redis_client,
+            redis_keys.cartesian_task_current_position,
+            (3,),
+        )
+        set_cartesian_goal(redis_client, current_position, locked_orientation)
         time.sleep(DT)
 
-    return current_position, hold_orientation
+    current_position = read_np(
+        redis_client,
+        redis_keys.cartesian_task_current_position,
+        (3,),
+    )
+    return current_position, locked_orientation
+
+
+def stream_cartesian_pose_path(
+    redis_client,
+    waypoints: list[CartesianPoseWaypoint],
+    *,
+    pos_tol_m: float = POS_TOL_M,
+    ori_tol_rad: float = ORI_TOL_RAD,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+    max_orientation_step_rad: float = CARTESIAN_MAX_ORI_STEP_RAD,
+    arc_sagitta_m: float = TOOL_ARC_SAGITTA_M,
+    arc_min_radius_m: float = TOOL_ARC_MIN_RADIUS_M,
+    arc_side: str = TOOL_ARC_SIDE,
+    status_period_s: float = STATUS_PERIOD_S,
+    timeout_s: float = TIMEOUT_PER_WAYPOINT_S,
+) -> bool:
+    if len(waypoints) < 2:
+        return True
+
+    print("\nCartesian TOOL_INIT pose path:")
+    for waypoint in waypoints:
+        print(f"  {waypoint.label}: {np.round(waypoint.position_m, 5).tolist()} m")
+
+    loop_time = 0.0
+    last_status = 0.0
+    start_time = time.perf_counter()
+    time.sleep(0.01)
+    init_time = time.perf_counter_ns() * 1e-9
+
+    for segment_index, (start_wp, end_wp) in enumerate(
+        zip(waypoints[:-1], waypoints[1:]),
+        start=1,
+    ):
+        angle = rotation_error_rad(start_wp.orientation, end_wp.orientation)
+        orientation_steps = max(
+            1,
+            int(math.ceil(angle / max(max_orientation_step_rad, 1.0e-4))),
+        )
+        position_path, arc_radius, chosen_arc_side = build_tool_translation_path(
+            start_wp.position_m,
+            end_wp.position_m,
+            sagitta_m=arc_sagitta_m,
+            step_m=max_cartesian_step_m,
+            arc_side=arc_side,
+            min_radius_m=arc_min_radius_m,
+        )
+        if len(position_path) < orientation_steps:
+            position_path, arc_radius, chosen_arc_side = build_tool_translation_path(
+                start_wp.position_m,
+                end_wp.position_m,
+                sagitta_m=arc_sagitta_m,
+                step_m=max_cartesian_step_m * len(position_path) / orientation_steps,
+                arc_side=arc_side,
+                min_radius_m=arc_min_radius_m,
+            )
+        num_steps = len(position_path)
+        path_length = float(
+            np.sum(np.linalg.norm(np.diff(
+                np.vstack([start_wp.position_m, position_path]),
+                axis=0,
+            ), axis=1))
+        )
+        print(
+            f"Streaming {start_wp.label}->{end_wp.label}:",
+            f"{num_steps} samples",
+            f"| path {path_length:.4f} m",
+            f"| rotation {angle:.4f} rad",
+            f"| xy_arc_radius {arc_radius:.4f} m",
+            f"| min_xy_radius {min_xy_radius(position_path):.4f} m",
+            f"| arc_side {chosen_arc_side}",
+        )
+
+        for step_index, commanded_position in enumerate(position_path, start=1):
+            loop_time += DT
+            time.sleep(
+                max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
+            )
+
+            u = step_index / num_steps
+            s = 3.0 * u * u - 2.0 * u * u * u
+            commanded_orientation = slerp_orientation(
+                start_wp.orientation,
+                end_wp.orientation,
+                s,
+            )
+            set_cartesian_goal(redis_client, commanded_position, commanded_orientation)
+
+            current_position, current_orientation = read_cartesian_pose(redis_client)
+            pos_err = position_error(current_position, end_wp.position_m)
+            ori_err = rotation_error_rad(current_orientation, end_wp.orientation)
+
+            if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+                print(
+                    "STREAMING_TOOL_CARTESIAN",
+                    "| segment:",
+                    f"{segment_index}/{len(waypoints) - 1}",
+                    "| target:",
+                    end_wp.label,
+                    "| sample:",
+                    f"{step_index}/{num_steps}",
+                    "| pos_error:",
+                    round(pos_err, 5),
+                    "| ori_error_rad:",
+                    round(ori_err, 5),
+                )
+                last_status = loop_time
+
+            if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+                print(f"Timed out while streaming to {end_wp.label}.")
+                print("Final position error:", round(pos_err, 5))
+                print("Final orientation error rad:", round(ori_err, 5))
+                return False
+
+    final_wp = waypoints[-1]
+    set_cartesian_goal(redis_client, final_wp.position_m, final_wp.orientation)
+    while True:
+        current_position, current_orientation = read_cartesian_pose(redis_client)
+        pos_err = position_error(current_position, final_wp.position_m)
+        ori_err = rotation_error_rad(current_orientation, final_wp.orientation)
+        if pos_err < pos_tol_m and ori_err < ori_tol_rad:
+            print(f"Reached {final_wp.label}.")
+            return True
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                "SETTLING_TOOL_CARTESIAN",
+                "| pos_error:",
+                round(pos_err, 5),
+                "| ori_error_rad:",
+                round(ori_err, 5),
+            )
+            last_status = loop_time
+
+        if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+            print(f"Timed out settling at {final_wp.label}.")
+            print("Final position error:", round(pos_err, 5))
+            print("Final orientation error rad:", round(ori_err, 5))
+            return False
+
+        set_cartesian_goal(redis_client, final_wp.position_m, final_wp.orientation)
+        time.sleep(DT)
+        loop_time += DT
+
+
+def approach_tool_init_cartesian(
+    redis_client,
+    *,
+    dwell_at_init_s: float = 0.25,
+    dwell_at_tool_init_s: float = 0.5,
+    pos_tol_m: float = POS_TOL_M,
+    ori_tol_rad: float = ORI_TOL_RAD,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+    max_orientation_step_rad: float = CARTESIAN_MAX_ORI_STEP_RAD,
+    arc_sagitta_m: float = TOOL_ARC_SAGITTA_M,
+    arc_min_radius_m: float = TOOL_ARC_MIN_RADIUS_M,
+    arc_side: str = TOOL_ARC_SIDE,
+    status_period_s: float = STATUS_PERIOD_S,
+    timeout_s: float = TIMEOUT_PER_WAYPOINT_S,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """INIT_POS -> TOOL_WP1 -> TOOL_WP2 -> TOOL_INIT as Cartesian poses."""
+    cfg = load_demo_day_config()
+    init_pos = load_init_pos_m(cfg)
+    current_position, current_orientation = read_cartesian_pose(redis_client)
+
+    print("Moving to INIT_POS before Cartesian tool path.")
+    print("Current Cartesian position:", np.round(current_position, 5))
+    print("INIT_POS target:", np.round(init_pos, 5))
+
+    set_cartesian_goal(redis_client, current_position, current_orientation)
+    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
+    print("Using controller:", CARTESIAN_CONTROLLER)
+
+    if not go_to_waypoint(
+        redis_client,
+        target_pos=init_pos,
+        hold_orientation=current_orientation,
+        label="INIT_POS",
+        dwell_s=dwell_at_init_s,
+        timeout_s=timeout_s,
+        status_period_s=status_period_s,
+    ):
+        return None
+
+    start_position, start_orientation = read_cartesian_pose(redis_client)
+    pose_waypoints = [
+        CartesianPoseWaypoint("INIT_POS", start_position, start_orientation),
+        *load_cartesian_tool_waypoints(cfg),
+    ]
+
+    if not stream_cartesian_pose_path(
+        redis_client,
+        pose_waypoints,
+        pos_tol_m=pos_tol_m,
+        ori_tol_rad=ori_tol_rad,
+        max_cartesian_step_m=max_cartesian_step_m,
+        max_orientation_step_rad=max_orientation_step_rad,
+        arc_sagitta_m=arc_sagitta_m,
+        arc_min_radius_m=arc_min_radius_m,
+        arc_side=arc_side,
+        status_period_s=status_period_s,
+        timeout_s=timeout_s,
+    ):
+        return None
+
+    final_wp = pose_waypoints[-1]
+    if dwell_at_tool_init_s > 0.0:
+        time.sleep(dwell_at_tool_init_s)
+    return final_wp.position_m, final_wp.orientation
 
 
 # ---------------------------------------------------------------------------

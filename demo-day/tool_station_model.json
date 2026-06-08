@@ -1,0 +1,119 @@
+{
+  "units": "millimeters",
+  "frame": "Station frame. Origin: top-left corner of tag id 10. +X: along the row of tags toward decreasing tag id. +Y: across the table toward containers. +Z: out of the tag face.",
+  "tag_size_mm": 35.0,
+  "margin_mm": 5.0,
+  "reference_tag_id": 10,
+  "paint_container_size_mm": 50.0,
+  "paint_permitted_diameter_mm": 35.0,
+  "paint_depth_mm": 40.0,
+  "water_container_diameter_mm": 85.0,
+  "water_permitted_diameter_mm": 75.0,
+  "water_depth_mm": 50.0,
+  "paint_init_hover_z_offset_mm": 50.0,
+  "water_init_hover_z_offset_mm": 50.0,
+  "tag_tl_mm": {
+    "10": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "11": [
+      -60.0,
+      0.0,
+      0.0
+    ],
+    "12": [
+      -120.0,
+      0.0,
+      0.0
+    ],
+    "13": [
+      -200.0,
+      0.0,
+      0.0
+    ]
+  },
+  "volumes": [
+    {
+      "name": "paint_1",
+      "center_mm": [
+        -17.5,
+        65.0,
+        0.0
+      ],
+      "radius_mm": 17.5,
+      "z_min_mm": -40.0,
+      "z_max_mm": 0.0,
+      "init_hover_z_offset_mm": 50.0,
+      "init_hover_point_station_mm": [
+        -17.5,
+        65.0,
+        50.0
+      ]
+    },
+    {
+      "name": "paint_2",
+      "center_mm": [
+        -77.5,
+        65.0,
+        0.0
+      ],
+      "radius_mm": 17.5,
+      "z_min_mm": -40.0,
+      "z_max_mm": 0.0,
+      "init_hover_z_offset_mm": 50.0,
+      "init_hover_point_station_mm": [
+        -77.5,
+        65.0,
+        50.0
+      ]
+    },
+    {
+      "name": "paint_3",
+      "center_mm": [
+        -137.5,
+        65.0,
+        0.0
+      ],
+      "radius_mm": 17.5,
+      "z_min_mm": -40.0,
+      "z_max_mm": 0.0,
+      "init_hover_z_offset_mm": 50.0,
+      "init_hover_point_station_mm": [
+        -137.5,
+        65.0,
+        50.0
+      ]
+    },
+    {
+      "name": "water",
+      "center_mm": [
+        -217.5,
+        82.5,
+        0.0
+      ],
+      "radius_mm": 37.5,
+      "z_min_mm": -50.0,
+      "z_max_mm": 0.0,
+      "init_hover_z_offset_mm": 50.0,
+      "init_hover_point_station_mm": [
+        -217.5,
+        82.5,
+        50.0
+      ]
+    }
+  ],
+  "init_visit_order": [
+    "paint_1",
+    "paint_2",
+    "paint_3",
+    "water"
+  ],
+  "volume_name_to_init_label": {
+    "paint_1": "P1_INIT",
+    "paint_2": "P2_INIT",
+    "paint_3": "P3_INIT",
+    "water": "WATER_INIT"
+  }
+}

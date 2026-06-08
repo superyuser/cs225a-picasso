@@ -53,7 +53,7 @@ ARC_SAGITTA_M = 0.25
 # enough to lift the radius back up to ARC_MIN_RADIUS_M (i.e. the arc becomes
 # flatter / smoother). Crank this up (e.g. 2.0+) to make paths effectively
 # straight when the cartesian controller is still shaky.
-ARC_MIN_RADIUS_M = 1.0
+ARC_MIN_RADIUS_M = 2.0
 LAST_JOINT_TARGET_DEG = 90.0
 JOINT_ARRIVAL_THRESHOLD = 8.0e-2
 JOINT_MAX_STEP_DEG = 0.5
@@ -885,7 +885,7 @@ def move_to_camera_init(
 
             elif state == CameraState.RETURNING_LAST_JOINT:
                 current_joint_position = read_np(
-                    redis_client,git add
+                    redis_client,
                     redis_keys.sensor_joint_positions,
                     (7,),
                 )

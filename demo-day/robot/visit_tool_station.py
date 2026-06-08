@@ -1,16 +1,17 @@
-"""Move the robot to the tool-station TOOL_INIT joint pose.
+"""Move the robot to the tool-station TOOL_INIT Cartesian pose.
 
 Flow:
-    INIT_POS (Cartesian) -> TOOL_SAFE_APPROACH -> TOOL_SAFE_APPROACH_2 -> TOOL_INIT
+    INIT_POS -> TOOL_WP1 -> TOOL_WP2 -> TOOL_INIT as Cartesian poses
     then Cartesian paint dips:
         P1_INIT_POS -> dip -> P2_INIT_POS -> dip -> P3_INIT_POS -> dip
         -> WATER_INIT_POS -> swirl water -> WATER_TO_NAPKIN_INIT_POS -> wipe napkin
 
-Each dip is hover -> hover + z_dive_in_offset -> hover (see helpers/primitives.py).
+Each paint dip is hover -> dive -> 20 mm circle x3 -> dive center -> hover
+(see helpers/primitives.py).
 
 Usage:
     python robot/visit_tool_station.py
-    python robot/visit_tool_station.py --joint-max-step-deg 0.25
+    python robot/visit_tool_station.py --cartesian-max-step-m 0.001
 """
 
 from __future__ import annotations
@@ -40,17 +41,23 @@ try:
 except ImportError:
     redis = None
 
-from helpers.joint_motion import approach_tool_init
 from helpers.primitives import (
     dip_paint_1,
     dip_paint_2,
     dip_paint_3,
     load_paint_init_pos_m,
+    load_paint_station_y_offset_m,
+    load_paint_swirl_diameter_m,
+    load_paint_swirl_revolutions,
     load_z_dive_in_offset_m,
     swirl_water,
     wipe_napkin,
 )
 from helpers.tool_station_coords import (
+    TOOL_ARC_MIN_RADIUS_M,
+    TOOL_ARC_SAGITTA_M,
+    TOOL_ARC_SIDE,
+    approach_tool_init_cartesian,
     seed_cartesian_goal_at_current,
     switch_to_cartesian_hold_current,
 )
@@ -1368,6 +1375,7 @@ def make_cartesian_move_fn(
 def run_paint_dip_sequence(
     redis_client,
     *,
+    hold_orientation: np.ndarray | None = None,
     pos_tol_m: float = POS_TOL_M,
     hover_dwell_s: float = DWELL_AT_PAINT_HOVER_S,
     dip_dwell_s: float = DWELL_AT_PAINT_DIP_S,
@@ -1379,14 +1387,34 @@ def run_paint_dip_sequence(
 ) -> bool:
     cfg = load_demo_day_config()
 
-    print("Preparing Cartesian motion from measured TOOL_INIT pose.")
-    current_position, hold_orientation = switch_to_cartesian_hold_current(
-        redis_client,
-        settle_s=CARTESIAN_SETTLE_S,
-    )
+    if hold_orientation is None:
+        print("Preparing Cartesian motion from measured TOOL_INIT pose.")
+        current_position, hold_orientation = switch_to_cartesian_hold_current(
+            redis_client,
+            settle_s=CARTESIAN_SETTLE_S,
+        )
+    else:
+        current_position = read_np(
+            redis_client,
+            redis_keys.cartesian_task_current_position,
+            (3,),
+        )
+        print("Using TOOL_INIT orientation from Cartesian approach.")
+        print("Current Cartesian position:", np.round(current_position, 5))
+        set_cartesian_goal(redis_client, current_position, hold_orientation)
+        set_active_controller(redis_client, CARTESIAN_CONTROLLER)
     print(
         "z_dive_in_offset (mm):",
         round(load_z_dive_in_offset_m(cfg) * 1000.0, 3),
+    )
+    print(
+        "paint_station_y_offset (m):",
+        round(load_paint_station_y_offset_m(cfg), 5),
+    )
+    print(
+        "paint circle:",
+        f"diameter={load_paint_swirl_diameter_m(cfg) * 1000.0:.1f} mm,",
+        f"revolutions={load_paint_swirl_revolutions(cfg)}",
     )
 
     move_fn = make_cartesian_move_fn(
@@ -1509,17 +1537,15 @@ def run_paint_dip_sequence(
 def move_to_tool_init(
     *,
     config_file_name_expected: str = CONFIG_FILE_FOR_THIS_SCRIPT,
-    joint_arrival_threshold: float = JOINT_ARRIVAL_THRESHOLD,
-    joint_max_step_deg: float = JOINT_MAX_STEP_DEG,
-    joint_controller_settle_s: float = JOINT_CONTROLLER_SETTLE_S,
     dwell_s: float = DWELL_AT_TOOL_INIT_S,
     status_period_s: float = STATUS_PERIOD_S,
     timeout_s: float = TIMEOUT_S,
     save_path_plot: bool = True,
     path_log_dir: Path = DEFAULT_PATH_LOG_DIR,
-    use_cached_tool_init_path: bool = True,
-    rebuild_tool_init_path: bool = False,
     max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+    tool_arc_sagitta_m: float = TOOL_ARC_SAGITTA_M,
+    tool_arc_min_radius_m: float = TOOL_ARC_MIN_RADIUS_M,
+    tool_arc_side: str = TOOL_ARC_SIDE,
 ) -> int:
     path_trace: list[PathTraceSample] = []
     trace_start = time.perf_counter()
@@ -1537,22 +1563,23 @@ def move_to_tool_init(
     if not ensure_robot_ready(redis_client, config_file_name_expected):
         return finish(1)
 
-    approach = approach_tool_init(
+    tool_init_pose = approach_tool_init_cartesian(
         redis_client,
-        joint_arrival_threshold=joint_arrival_threshold,
-        joint_max_step_deg=joint_max_step_deg,
-        joint_controller_settle_s=joint_controller_settle_s,
         dwell_at_tool_init_s=dwell_s,
+        max_cartesian_step_m=max_cartesian_step_m,
+        arc_sagitta_m=tool_arc_sagitta_m,
+        arc_min_radius_m=tool_arc_min_radius_m,
+        arc_side=tool_arc_side,
         status_period_s=status_period_s,
         timeout_s=timeout_s,
-        use_cached_path=use_cached_tool_init_path,
-        rebuild_path=rebuild_tool_init_path,
     )
-    if approach is None:
+    if tool_init_pose is None:
         return finish(1)
+    _tool_init_position, tool_init_orientation = tool_init_pose
 
     if not run_paint_dip_sequence(
         redis_client,
+        hold_orientation=tool_init_orientation,
         status_period_s=status_period_s,
         timeout_s=timeout_s,
         path_trace=path_trace,
@@ -1581,27 +1608,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Expected Sai config file (default: {CONFIG_FILE_FOR_THIS_SCRIPT}).",
     )
     parser.add_argument(
-        "--joint-arrival-threshold",
-        type=float,
-        default=JOINT_ARRIVAL_THRESHOLD,
-        help=f"Joint-space arrival threshold in radians (default: {JOINT_ARRIVAL_THRESHOLD}).",
-    )
-    parser.add_argument(
-        "--joint-max-step-deg",
-        type=float,
-        default=JOINT_MAX_STEP_DEG,
-        help=f"Maximum joint-command step per loop in degrees (default: {JOINT_MAX_STEP_DEG}).",
-    )
-    parser.add_argument(
-        "--joint-controller-settle-s",
-        type=float,
-        default=JOINT_CONTROLLER_SETTLE_S,
-        help=(
-            "Seconds to hold measured joints after switching to joint_controller "
-            f"(default: {JOINT_CONTROLLER_SETTLE_S})."
-        ),
-    )
-    parser.add_argument(
         "--dwell-s",
         type=float,
         default=DWELL_AT_TOOL_INIT_S,
@@ -1623,25 +1629,40 @@ def parse_args() -> argparse.Namespace:
         help=f"Maximum seconds to wait for arrival. Use 0 to disable (default: {TIMEOUT_S}).",
     )
     parser.add_argument(
-        "--rebuild-tool-init-path",
-        action="store_true",
-        help=(
-            "Rebuild and save demo-day/tool_init_joint_path.json instead of "
-            "using the cached joint path."
-        ),
-    )
-    parser.add_argument(
-        "--no-cached-tool-init-path",
-        action="store_true",
-        help="Do not load the cached INIT_POS -> TOOL_INIT joint path JSON.",
-    )
-    parser.add_argument(
         "--cartesian-max-step-m",
         type=float,
         default=CARTESIAN_MAX_STEP_M,
         help=(
             "Maximum Cartesian goal step per 10 ms tick when streaming to "
-            f"paint-station waypoints (default: {CARTESIAN_MAX_STEP_M})."
+            f"tool/paint-station waypoints (default: {CARTESIAN_MAX_STEP_M})."
+        ),
+    )
+    parser.add_argument(
+        "--tool-arc-sagitta-m",
+        type=float,
+        default=TOOL_ARC_SAGITTA_M,
+        help=(
+            "XY arc sagitta for the Cartesian INIT_POS -> TOOL_INIT path "
+            f"(default: {TOOL_ARC_SAGITTA_M})."
+        ),
+    )
+    parser.add_argument(
+        "--tool-arc-min-radius-m",
+        type=float,
+        default=TOOL_ARC_MIN_RADIUS_M,
+        help=(
+            "Minimum XY arc curvature radius for the Cartesian tool path. "
+            "If the requested sagitta would make a sharper arc, the sagitta "
+            f"is reduced to flatten it (default: {TOOL_ARC_MIN_RADIUS_M})."
+        ),
+    )
+    parser.add_argument(
+        "--tool-arc-side",
+        choices=("auto", "left", "right"),
+        default=TOOL_ARC_SIDE,
+        help=(
+            "Which side to bulge the XY arcs. auto picks the side with the "
+            f"larger minimum distance from the robot base (default: {TOOL_ARC_SIDE})."
         ),
     )
     return parser.parse_args()
@@ -1652,17 +1673,15 @@ def main() -> int:
     try:
         return move_to_tool_init(
             config_file_name_expected=args.config_file,
-            joint_arrival_threshold=args.joint_arrival_threshold,
-            joint_max_step_deg=args.joint_max_step_deg,
-            joint_controller_settle_s=args.joint_controller_settle_s,
             dwell_s=args.dwell_s,
             status_period_s=args.status_period_s,
             timeout_s=args.timeout_s,
             save_path_plot=not args.no_path_plot,
             path_log_dir=Path(args.path_log_dir),
-            use_cached_tool_init_path=not args.no_cached_tool_init_path,
-            rebuild_tool_init_path=args.rebuild_tool_init_path,
             max_cartesian_step_m=args.cartesian_max_step_m,
+            tool_arc_sagitta_m=args.tool_arc_sagitta_m,
+            tool_arc_min_radius_m=args.tool_arc_min_radius_m,
+            tool_arc_side=args.tool_arc_side,
         )
     except RuntimeError as exc:
         print("Could not start tool-station run:")
