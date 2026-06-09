@@ -171,7 +171,7 @@ def main() -> None:
 
     cmd = [
         sys.executable,
-        str(SCRIPT_DIR / "run_pipeline_robust.py"),
+        str(SCRIPT_DIR / "run_pipeline_robust_bst.py"),
         "--input",
         str(portrait_path),
         "--strokes-dir",
