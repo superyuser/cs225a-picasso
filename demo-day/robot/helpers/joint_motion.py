@@ -36,7 +36,7 @@ JOINT_CONTROLLER = "joint_controller"
 
 DEG_TO_RAD = math.pi / 180.0
 JOINT_ARRIVAL_THRESHOLD = 0.25
-JOINT_MAX_STEP_DEG = 0.5
+JOINT_MAX_STEP_DEG = 0.25
 JOINT_CONTROLLER_SETTLE_S = 0.25
 CARTESIAN_SETTLE_S = 0.25
 DWELL_AT_INIT_POS_S = 0.25
@@ -145,6 +145,7 @@ def load_tool_init_joint_path(
     *,
     joint_path_json: Path = DEFAULT_TOOL_INIT_JOINT_PATH_JSON,
     require_valid_config: bool = True,
+    max_joint_step_deg: float | None = JOINT_MAX_STEP_DEG,
 ) -> ToolInitApproachResult | None:
     if not joint_path_json.is_file():
         return None
@@ -162,6 +163,16 @@ def load_tool_init_joint_path(
             "rebuild required."
         )
         return None
+
+    saved_joint_max_step_deg = saved.get("joint_max_step_deg")
+    if max_joint_step_deg is not None and saved_joint_max_step_deg is not None:
+        if float(saved_joint_max_step_deg) > float(max_joint_step_deg) * 1.001:
+            print(
+                "Cached tool-init joint path was generated with a larger "
+                f"joint step ({float(saved_joint_max_step_deg):.3f} deg) than "
+                f"requested ({float(max_joint_step_deg):.3f} deg); rebuild required."
+            )
+            return None
 
     forward_joint_path = np.array(saved["forward_path_deg"], dtype=float) * DEG_TO_RAD
     if forward_joint_path.ndim != 2 or forward_joint_path.shape[1] != 7:
@@ -190,7 +201,7 @@ def build_tool_init_approach_result(
     *,
     max_joint_step: float,
     joint_path_json: Path | None = DEFAULT_TOOL_INIT_JOINT_PATH_JSON,
-    save_path: bool = True,
+    save_path: bool = False,
 ) -> ToolInitApproachResult:
     path, waypoint_indices, tool_init_rad = build_tool_init_approach_path(
         start_joint_rad,
@@ -221,10 +232,15 @@ def resolve_tool_init_approach_path(
     joint_path_json: Path = DEFAULT_TOOL_INIT_JOINT_PATH_JSON,
     use_cached_path: bool = True,
     rebuild_path: bool = False,
-    save_path: bool = True,
+    save_path: bool = False,
+    require_cached_path: bool = False,
 ) -> ToolInitApproachResult:
     if use_cached_path and not rebuild_path:
-        cached = load_tool_init_joint_path(joint_path_json=joint_path_json)
+        cached = load_tool_init_joint_path(
+            joint_path_json=joint_path_json,
+            require_valid_config=False,
+            max_joint_step_deg=None,
+        )
         if cached is not None:
             start_error = float(
                 np.linalg.norm(start_joint_rad - cached.start_joint_rad)
@@ -235,6 +251,12 @@ def resolve_tool_init_approach_path(
                     f"start by {start_error:.4f} rad; using cached path anyway."
                 )
             return cached
+        if require_cached_path:
+            raise RuntimeError(
+                "Cached joint INIT_POS -> TOOL_INIT path could not be loaded "
+                f"from {joint_path_json}. Run with --rebuild-tool-init-path "
+                "only when you intentionally want to regenerate it."
+            )
 
     return build_tool_init_approach_result(
         start_joint_rad,
@@ -595,7 +617,8 @@ def approach_tool_init(
     joint_path_json: Path = DEFAULT_TOOL_INIT_JOINT_PATH_JSON,
     use_cached_path: bool = True,
     rebuild_path: bool = False,
-    save_path: bool = True,
+    save_path: bool = False,
+    require_cached_path: bool = True,
 ) -> ToolInitApproachResult | None:
     """INIT_POS (Cartesian) -> TOOL_SAFE_APPROACH -> TOOL_SAFE_APPROACH_2 -> TOOL_INIT."""
     if not move_cartesian_to_init_pos(
@@ -618,6 +641,7 @@ def approach_tool_init(
         use_cached_path=use_cached_path,
         rebuild_path=rebuild_path,
         save_path=save_path,
+        require_cached_path=require_cached_path,
     )
     path = approach.forward_joint_path
     tool_init_rad = approach.tool_init_rad
@@ -682,7 +706,11 @@ def return_from_tool_init(
         if not use_cached_path:
             print("No approach result provided and cached path use is disabled.")
             return False
-        approach = load_tool_init_joint_path(joint_path_json=joint_path_json)
+        approach = load_tool_init_joint_path(
+            joint_path_json=joint_path_json,
+            require_valid_config=False,
+            max_joint_step_deg=None,
+        )
         if approach is None:
             print("Could not load cached tool-init joint path for return.")
             return False

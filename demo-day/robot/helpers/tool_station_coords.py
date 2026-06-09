@@ -37,10 +37,12 @@ DEMO_DAY_CONFIG_PATH = DEMO_DAY_DIR / "config.json"
 DEFAULT_TOOL_STATION_MODEL_JSON = DEMO_DAY_DIR / "tool_station_model.json"
 DEFAULT_TOOL_STATION_OBSERVATION_JSON = DEMO_DAY_DIR / "tool_station_observation.json"
 DEFAULT_TOOL_STATION_WORLD_JSON = DEMO_DAY_DIR / "tool_station_world_positions.json"
+DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON = DEMO_DAY_DIR / "tool_init_cartesian_path.json"
 
 ROBOT_NAME = "Titania"
 CONFIG_FILE_FOR_THIS_SCRIPT = "basket.xml"
 CARTESIAN_CONTROLLER = "cartesian_controller"
+TOOL_INIT_CARTESIAN_PATH_VERSION = 1
 
 DT = 0.01
 MM_TO_M = 1.0e-3
@@ -53,10 +55,15 @@ TIMEOUT_PER_WAYPOINT_S = 30.0
 STATUS_PERIOD_S = 0.25
 CARTESIAN_SETTLE_S = 0.25
 CARTESIAN_MAX_STEP_M = 0.002
-CARTESIAN_MAX_ORI_STEP_RAD = 0.01
+CARTESIAN_MAX_ORI_STEP_RAD = 0.0025
 TOOL_ARC_SAGITTA_M = 0.25
 TOOL_ARC_MIN_RADIUS_M = 1.6
 TOOL_ARC_SIDE = "auto"
+CACHED_TOOL_PATH_START_POS_TOL_M = 1.0e-2
+CACHED_TOOL_PATH_START_ORI_TOL_RAD = 2.0e-2
+CACHED_TOOL_PATH_CONFIG_POS_TOL_M = 1.0e-4
+CACHED_TOOL_PATH_CONFIG_ORI_TOL_RAD = 1.0e-4
+CACHED_TOOL_PATH_PARAM_TOL = 1.0e-9
 
 
 @dataclass
@@ -93,6 +100,15 @@ class CartesianPoseWaypoint:
     label: str
     position_m: np.ndarray
     orientation: np.ndarray
+
+
+@dataclass
+class CartesianPosePath:
+    source_waypoints: list[CartesianPoseWaypoint]
+    samples: list[CartesianPoseWaypoint]
+    segment_summaries: list[dict[str, Any]]
+    source: str
+    path_json: Path | None
 
 
 @dataclass
@@ -288,6 +304,12 @@ def slerp_orientation(start: np.ndarray, target: np.ndarray, fraction: float) ->
     return quat_to_matrix(scale_0 * q0 + scale_1 * q1)
 
 
+def smootherstep(fraction: float) -> float:
+    """Quintic interpolation with zero velocity and acceleration at endpoints."""
+    u = float(np.clip(fraction, 0.0, 1.0))
+    return u * u * u * (u * (u * 6.0 - 15.0) + 10.0)
+
+
 def load_init_pos_m(config: dict[str, Any] | None = None) -> np.ndarray:
     cfg = config or load_demo_day_config()
     init_pos = np.array(cfg["init_pos_m"], dtype=float)
@@ -443,6 +465,452 @@ def build_tool_translation_path(
     return right_path, right_radius, "right"
 
 
+def cartesian_pose_waypoint_to_json(
+    waypoint: CartesianPoseWaypoint,
+) -> dict[str, Any]:
+    return {
+        "label": waypoint.label,
+        "position_m": [float(v) for v in np.asarray(waypoint.position_m, dtype=float)],
+        "orientation": [
+            [float(v) for v in row]
+            for row in np.asarray(waypoint.orientation, dtype=float)
+        ],
+    }
+
+
+def cartesian_pose_waypoint_from_json(data: dict[str, Any]) -> CartesianPoseWaypoint:
+    position = np.array(data["position_m"], dtype=float)
+    orientation = np.array(data["orientation"], dtype=float)
+    if position.shape != (3,):
+        raise RuntimeError("Cached Cartesian waypoint position_m must have 3 values.")
+    if orientation.shape != (3, 3):
+        raise RuntimeError("Cached Cartesian waypoint orientation must be 3x3.")
+    return CartesianPoseWaypoint(
+        label=str(data["label"]),
+        position_m=position,
+        orientation=orientation,
+    )
+
+
+def tool_init_cartesian_path_parameters(
+    *,
+    max_cartesian_step_m: float,
+    max_orientation_step_rad: float,
+    arc_sagitta_m: float,
+    arc_min_radius_m: float,
+    arc_side: str,
+) -> dict[str, Any]:
+    return {
+        "max_cartesian_step_m": float(max_cartesian_step_m),
+        "max_orientation_step_rad": float(max_orientation_step_rad),
+        "arc_sagitta_m": float(arc_sagitta_m),
+        "arc_min_radius_m": float(arc_min_radius_m),
+        "arc_side": str(arc_side),
+    }
+
+
+def cached_tool_init_parameters_match(
+    saved_parameters: dict[str, Any],
+    current_parameters: dict[str, Any],
+) -> bool:
+    for key, current_value in current_parameters.items():
+        if key not in saved_parameters:
+            print(f"Cached Cartesian tool path is missing parameter {key}; rebuild required.")
+            return False
+
+        saved_value = saved_parameters[key]
+        if isinstance(current_value, str):
+            if str(saved_value) != current_value:
+                print(
+                    "Cached Cartesian tool path parameter mismatch for",
+                    f"{key}: saved {saved_value!r}, current {current_value!r};",
+                    "rebuild required.",
+                )
+                return False
+            continue
+
+        try:
+            saved_float = float(saved_value)
+            current_float = float(current_value)
+        except (TypeError, ValueError):
+            print(
+                "Cached Cartesian tool path parameter is invalid for",
+                f"{key}: {saved_value!r}; rebuild required.",
+            )
+            return False
+
+        if abs(saved_float - current_float) > CACHED_TOOL_PATH_PARAM_TOL:
+            print(
+                "Cached Cartesian tool path parameter mismatch for",
+                f"{key}: saved {saved_float:.9f}, current {current_float:.9f};",
+                "rebuild required.",
+            )
+            return False
+    return True
+
+
+def cached_tool_init_waypoints_match(
+    saved_waypoints: list[CartesianPoseWaypoint],
+    current_waypoints: list[CartesianPoseWaypoint],
+    *,
+    require_matching_config_waypoints: bool = False,
+) -> bool:
+    if not saved_waypoints or not current_waypoints:
+        print("Cached Cartesian tool path has no source/start waypoint; rebuild required.")
+        return False
+
+    if require_matching_config_waypoints and len(saved_waypoints) != len(current_waypoints):
+        print("Cached Cartesian tool path waypoint count changed; rebuild required.")
+        return False
+
+    waypoint_pairs = (
+        zip(saved_waypoints, current_waypoints)
+        if require_matching_config_waypoints
+        else [(saved_waypoints[0], current_waypoints[0])]
+    )
+    for index, (saved_wp, current_wp) in enumerate(waypoint_pairs):
+        if saved_wp.label != current_wp.label:
+            print(
+                "Cached Cartesian tool path waypoint labels changed:",
+                f"{saved_wp.label!r} != {current_wp.label!r}; rebuild required.",
+            )
+            return False
+
+        position_tol = (
+            CACHED_TOOL_PATH_START_POS_TOL_M
+            if index == 0
+            else CACHED_TOOL_PATH_CONFIG_POS_TOL_M
+        )
+        orientation_tol = (
+            CACHED_TOOL_PATH_START_ORI_TOL_RAD
+            if index == 0
+            else CACHED_TOOL_PATH_CONFIG_ORI_TOL_RAD
+        )
+        position_delta = position_error(saved_wp.position_m, current_wp.position_m)
+        orientation_delta = rotation_error_rad(saved_wp.orientation, current_wp.orientation)
+        if position_delta > position_tol or orientation_delta > orientation_tol:
+            print(
+                "Cached Cartesian tool path waypoint changed:",
+                saved_wp.label,
+                f"| position_delta {position_delta:.6f} m",
+                f"(tol {position_tol:.6f})",
+                f"| orientation_delta {orientation_delta:.6f} rad",
+                f"(tol {orientation_tol:.6f}); rebuild required.",
+            )
+            return False
+
+    return True
+
+
+def build_cartesian_pose_path_samples(
+    waypoints: list[CartesianPoseWaypoint],
+    *,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+    max_orientation_step_rad: float = CARTESIAN_MAX_ORI_STEP_RAD,
+    arc_sagitta_m: float = TOOL_ARC_SAGITTA_M,
+    arc_min_radius_m: float = TOOL_ARC_MIN_RADIUS_M,
+    arc_side: str = TOOL_ARC_SIDE,
+) -> tuple[list[CartesianPoseWaypoint], list[dict[str, Any]]]:
+    samples: list[CartesianPoseWaypoint] = []
+    segment_summaries: list[dict[str, Any]] = []
+
+    for segment_index, (start_wp, end_wp) in enumerate(
+        zip(waypoints[:-1], waypoints[1:]),
+        start=1,
+    ):
+        angle = rotation_error_rad(start_wp.orientation, end_wp.orientation)
+        orientation_steps = max(
+            1,
+            int(math.ceil(angle / max(max_orientation_step_rad, 1.0e-4))),
+        )
+        position_path, arc_radius, chosen_arc_side = build_tool_translation_path(
+            start_wp.position_m,
+            end_wp.position_m,
+            sagitta_m=arc_sagitta_m,
+            step_m=max_cartesian_step_m,
+            arc_side=arc_side,
+            min_radius_m=arc_min_radius_m,
+        )
+        if len(position_path) < orientation_steps:
+            position_path, arc_radius, chosen_arc_side = build_tool_translation_path(
+                start_wp.position_m,
+                end_wp.position_m,
+                sagitta_m=arc_sagitta_m,
+                step_m=max_cartesian_step_m * len(position_path) / orientation_steps,
+                arc_side=arc_side,
+                min_radius_m=arc_min_radius_m,
+            )
+
+        num_steps = len(position_path)
+        path_length = float(
+            np.sum(
+                np.linalg.norm(
+                    np.diff(
+                        np.vstack([start_wp.position_m, position_path]),
+                        axis=0,
+                    ),
+                    axis=1,
+                )
+            )
+        )
+        segment_label = f"{start_wp.label}->{end_wp.label}"
+
+        segment_summaries.append(
+            {
+                "segment_index": int(segment_index),
+                "start_label": start_wp.label,
+                "end_label": end_wp.label,
+                "num_steps": int(num_steps),
+                "path_length_m": path_length,
+                "rotation_rad": float(angle),
+                "max_orientation_step_rad": float(max_orientation_step_rad),
+                "xy_arc_radius_m": float(arc_radius),
+                "min_xy_radius_m": min_xy_radius(position_path),
+                "arc_side": chosen_arc_side,
+            }
+        )
+
+        for step_index, commanded_position in enumerate(position_path, start=1):
+            u = step_index / num_steps
+            s = smootherstep(u)
+            samples.append(
+                CartesianPoseWaypoint(
+                    label=segment_label,
+                    position_m=np.array(commanded_position, dtype=float),
+                    orientation=slerp_orientation(
+                        start_wp.orientation,
+                        end_wp.orientation,
+                        s,
+                    ),
+                )
+            )
+
+    return samples, segment_summaries
+
+
+def save_tool_init_cartesian_path(
+    cartesian_path: CartesianPosePath,
+    *,
+    parameters: dict[str, Any],
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+) -> Path:
+    payload = {
+        "version": TOOL_INIT_CARTESIAN_PATH_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "units": "meters",
+        "parameters": parameters,
+        "source_waypoints": [
+            cartesian_pose_waypoint_to_json(waypoint)
+            for waypoint in cartesian_path.source_waypoints
+        ],
+        "samples": [
+            cartesian_pose_waypoint_to_json(sample)
+            for sample in cartesian_path.samples
+        ],
+        "segment_summaries": cartesian_path.segment_summaries,
+    }
+
+    path_json.parent.mkdir(parents=True, exist_ok=True)
+    with path_json.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"Saved tool-init Cartesian path JSON: {path_json}")
+    print("Cartesian path samples:", len(cartesian_path.samples))
+    return path_json
+
+
+def load_tool_init_cartesian_path(
+    *,
+    current_waypoints: list[CartesianPoseWaypoint],
+    parameters: dict[str, Any],
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+    require_matching_config_waypoints: bool = False,
+) -> CartesianPosePath | None:
+    if not path_json.is_file():
+        return None
+
+    try:
+        with path_json.open("r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Could not read cached Cartesian tool path {path_json}: {exc}")
+        print("Rebuild required.")
+        return None
+
+    if saved.get("version") != TOOL_INIT_CARTESIAN_PATH_VERSION:
+        print(f"Unsupported Cartesian tool path JSON version in {path_json}.")
+        return None
+
+    saved_parameters = saved.get("parameters")
+    if not isinstance(saved_parameters, dict) or not cached_tool_init_parameters_match(
+        saved_parameters,
+        parameters,
+    ):
+        return None
+
+    saved_source = saved.get("source_waypoints")
+    if not isinstance(saved_source, list):
+        print("Cached Cartesian tool path is missing source_waypoints; rebuild required.")
+        return None
+    try:
+        source_waypoints = [
+            cartesian_pose_waypoint_from_json(waypoint)
+            for waypoint in saved_source
+        ]
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        print(f"Cached Cartesian tool path source_waypoints are invalid: {exc}")
+        print("Rebuild required.")
+        return None
+    if not cached_tool_init_waypoints_match(
+        source_waypoints,
+        current_waypoints,
+        require_matching_config_waypoints=require_matching_config_waypoints,
+    ):
+        return None
+
+    saved_samples = saved.get("samples")
+    if not isinstance(saved_samples, list) or not saved_samples:
+        print("Cached Cartesian tool path is missing samples; rebuild required.")
+        return None
+    try:
+        samples = [
+            cartesian_pose_waypoint_from_json(sample)
+            for sample in saved_samples
+        ]
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        print(f"Cached Cartesian tool path samples are invalid: {exc}")
+        print("Rebuild required.")
+        return None
+
+    segment_summaries = saved.get("segment_summaries", [])
+    if not isinstance(segment_summaries, list):
+        print("Cached Cartesian tool path segment_summaries are invalid; rebuild required.")
+        return None
+    try:
+        expected_samples = sum(
+            int(summary.get("num_steps", 0))
+            for summary in segment_summaries
+            if isinstance(summary, dict)
+        )
+    except (TypeError, ValueError):
+        print("Cached Cartesian tool path segment_summaries are invalid; rebuild required.")
+        return None
+    if expected_samples and expected_samples != len(samples):
+        print(
+            "Cached Cartesian tool path sample count does not match segment summaries; "
+            "rebuild required."
+        )
+        return None
+
+    print(f"Loaded tool-init Cartesian path JSON: {path_json}")
+    print("Cartesian path samples:", len(samples))
+    return CartesianPosePath(
+        source_waypoints=source_waypoints,
+        samples=samples,
+        segment_summaries=segment_summaries,
+        source="cached",
+        path_json=path_json,
+    )
+
+
+def load_saved_tool_init_cartesian_path(
+    *,
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+) -> CartesianPosePath | None:
+    if not path_json.is_file():
+        return None
+
+    try:
+        with path_json.open("r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Could not read cached Cartesian tool path {path_json}: {exc}")
+        return None
+
+    saved_parameters = saved.get("parameters")
+    saved_source = saved.get("source_waypoints")
+    if not isinstance(saved_parameters, dict) or not isinstance(saved_source, list):
+        print("Cached Cartesian tool path is missing parameters/source_waypoints.")
+        return None
+
+    try:
+        source_waypoints = [
+            cartesian_pose_waypoint_from_json(waypoint)
+            for waypoint in saved_source
+        ]
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        print(f"Cached Cartesian tool path source_waypoints are invalid: {exc}")
+        return None
+
+    return load_tool_init_cartesian_path(
+        current_waypoints=source_waypoints,
+        parameters=saved_parameters,
+        path_json=path_json,
+        require_matching_config_waypoints=True,
+    )
+
+
+def resolve_tool_init_cartesian_path(
+    waypoints: list[CartesianPoseWaypoint],
+    *,
+    max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+    max_orientation_step_rad: float = CARTESIAN_MAX_ORI_STEP_RAD,
+    arc_sagitta_m: float = TOOL_ARC_SAGITTA_M,
+    arc_min_radius_m: float = TOOL_ARC_MIN_RADIUS_M,
+    arc_side: str = TOOL_ARC_SIDE,
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+    use_cached_path: bool = True,
+    rebuild_path: bool = False,
+    save_path: bool = False,
+    require_cached_path: bool = False,
+) -> CartesianPosePath:
+    parameters = tool_init_cartesian_path_parameters(
+        max_cartesian_step_m=max_cartesian_step_m,
+        max_orientation_step_rad=max_orientation_step_rad,
+        arc_sagitta_m=arc_sagitta_m,
+        arc_min_radius_m=arc_min_radius_m,
+        arc_side=arc_side,
+    )
+
+    if use_cached_path and not rebuild_path:
+        cached = load_tool_init_cartesian_path(
+            current_waypoints=waypoints,
+            parameters=parameters,
+            path_json=path_json,
+        )
+        if cached is not None:
+            return cached
+        if require_cached_path:
+            raise RuntimeError(
+                "Cached Cartesian INIT_POS -> TOOL_INIT path could not be loaded "
+                f"from {path_json}. Run with --rebuild-tool-init-cartesian-path "
+                "only when you intentionally want to regenerate it."
+            )
+
+    samples, segment_summaries = build_cartesian_pose_path_samples(
+        waypoints,
+        max_cartesian_step_m=max_cartesian_step_m,
+        max_orientation_step_rad=max_orientation_step_rad,
+        arc_sagitta_m=arc_sagitta_m,
+        arc_min_radius_m=arc_min_radius_m,
+        arc_side=arc_side,
+    )
+    cartesian_path = CartesianPosePath(
+        source_waypoints=waypoints,
+        samples=samples,
+        segment_summaries=segment_summaries,
+        source="generated",
+        path_json=path_json,
+    )
+    if save_path:
+        save_tool_init_cartesian_path(
+            cartesian_path,
+            parameters=parameters,
+            path_json=path_json,
+        )
+    return cartesian_path
+
+
 def read_cartesian_pose(redis_client) -> tuple[np.ndarray, np.ndarray]:
     position = read_np(
         redis_client,
@@ -509,6 +977,77 @@ def switch_to_cartesian_hold_current(
     return current_position, locked_orientation
 
 
+def go_to_pose_waypoint(
+    redis_client,
+    *,
+    target_pos: np.ndarray,
+    target_orientation: np.ndarray,
+    label: str,
+    dwell_s: float,
+    timeout_s: float,
+    status_period_s: float,
+    pos_tol_m: float = POS_TOL_M,
+    ori_tol_rad: float = ORI_TOL_RAD,
+) -> bool:
+    print(f"\n-> {label}: target = {np.round(target_pos, 5).tolist()}")
+    print(f"Aligning position and orientation for {label}.")
+
+    seed_cartesian_goal_at_current(
+        redis_client,
+        hold_orientation=target_orientation,
+    )
+    set_cartesian_goal(redis_client, target_pos, target_orientation)
+
+    loop_time = 0.0
+    last_status = 0.0
+    last_refresh = 0.0
+    time.sleep(0.01)
+    init_time = time.perf_counter_ns() * 1e-9
+    start = time.perf_counter()
+
+    while True:
+        loop_time += DT
+        time.sleep(
+            max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
+        )
+
+        if loop_time - last_refresh >= INTER_GOAL_REFRESH_S:
+            set_cartesian_goal(redis_client, target_pos, target_orientation)
+            last_refresh = loop_time
+
+        current_position, current_orientation = read_cartesian_pose(redis_client)
+        pos_err = position_error(current_position, target_pos)
+        ori_err = rotation_error_rad(current_orientation, target_orientation)
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                f"MOVING_TO_{label}",
+                "| pos_error:",
+                f"{pos_err:.5f}",
+                "| ori_error_rad:",
+                f"{ori_err:.5f}",
+            )
+            last_status = loop_time
+
+        if pos_err < pos_tol_m and ori_err < ori_tol_rad:
+            break
+
+        if timeout_s > 0.0 and time.perf_counter() - start > timeout_s:
+            print(
+                f"Timed out before reaching {label}.",
+                "Final position error:",
+                round(pos_err, 5),
+                "Final orientation error rad:",
+                round(ori_err, 5),
+            )
+            return False
+
+    print(f"Reached {label}. Dwelling {dwell_s:.2f}s.")
+    if dwell_s > 0.0:
+        time.sleep(dwell_s)
+    return True
+
+
 def stream_cartesian_pose_path(
     redis_client,
     waypoints: list[CartesianPoseWaypoint],
@@ -522,13 +1061,85 @@ def stream_cartesian_pose_path(
     arc_side: str = TOOL_ARC_SIDE,
     status_period_s: float = STATUS_PERIOD_S,
     timeout_s: float = TIMEOUT_PER_WAYPOINT_S,
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+    use_cached_path: bool = True,
+    rebuild_path: bool = False,
+    save_path: bool = False,
+    require_cached_path: bool = True,
 ) -> bool:
     if len(waypoints) < 2:
         return True
 
+    if use_cached_path and not rebuild_path:
+        cartesian_path = load_saved_tool_init_cartesian_path(path_json=path_json)
+        if cartesian_path is None:
+            if require_cached_path:
+                raise RuntimeError(
+                    "Cached Cartesian INIT_POS -> TOOL_INIT path could not be "
+                    f"loaded from {path_json}. Run with rebuild only when you "
+                    "intentionally want to regenerate it."
+                )
+            cartesian_path = resolve_tool_init_cartesian_path(
+                waypoints,
+                max_cartesian_step_m=max_cartesian_step_m,
+                max_orientation_step_rad=max_orientation_step_rad,
+                arc_sagitta_m=arc_sagitta_m,
+                arc_min_radius_m=arc_min_radius_m,
+                arc_side=arc_side,
+                path_json=path_json,
+                use_cached_path=False,
+                rebuild_path=False,
+                save_path=save_path,
+                require_cached_path=False,
+            )
+    else:
+        cartesian_path = resolve_tool_init_cartesian_path(
+            waypoints,
+            max_cartesian_step_m=max_cartesian_step_m,
+            max_orientation_step_rad=max_orientation_step_rad,
+            arc_sagitta_m=arc_sagitta_m,
+            arc_min_radius_m=arc_min_radius_m,
+            arc_side=arc_side,
+            path_json=path_json,
+            use_cached_path=use_cached_path,
+            rebuild_path=rebuild_path,
+            save_path=save_path,
+            require_cached_path=require_cached_path,
+        )
+    if not cartesian_path.samples:
+        return True
+
+    active_waypoints = cartesian_path.source_waypoints or waypoints
     print("\nCartesian TOOL_INIT pose path:")
-    for waypoint in waypoints:
+    for waypoint in active_waypoints:
         print(f"  {waypoint.label}: {np.round(waypoint.position_m, 5).tolist()} m")
+    print(f"Cartesian path source: {cartesian_path.source}")
+    if cartesian_path.path_json is not None:
+        print(f"Cartesian path JSON: {cartesian_path.path_json}")
+
+    max_ori_step_deg = max_orientation_step_rad / DEG_TO_RAD
+    for summary in cartesian_path.segment_summaries:
+        print(
+            f"Streaming {summary.get('start_label')}->{summary.get('end_label')}:",
+            f"{int(summary.get('num_steps', 0))} samples",
+            f"| path {float(summary.get('path_length_m', 0.0)):.4f} m",
+            f"| rotation {float(summary.get('rotation_rad', 0.0)):.4f} rad",
+            f"| max_ori_step {max_orientation_step_rad:.5f} rad ({max_ori_step_deg:.3f} deg)",
+            f"| xy_arc_radius {float(summary.get('xy_arc_radius_m', math.inf)):.4f} m",
+            f"| min_xy_radius {float(summary.get('min_xy_radius_m', math.inf)):.4f} m",
+            f"| arc_side {summary.get('arc_side')}",
+        )
+
+    waypoint_by_label = {waypoint.label: waypoint for waypoint in active_waypoints}
+    segment_ranges: list[tuple[int, int, dict[str, Any]]] = []
+    cursor = 1
+    for summary in cartesian_path.segment_summaries:
+        num_steps = int(summary.get("num_steps", 0))
+        if num_steps <= 0:
+            continue
+        segment_ranges.append((cursor, cursor + num_steps - 1, summary))
+        cursor += num_steps
+    segment_count = max(1, len(segment_ranges))
 
     loop_time = 0.0
     last_status = 0.0
@@ -536,91 +1147,59 @@ def stream_cartesian_pose_path(
     time.sleep(0.01)
     init_time = time.perf_counter_ns() * 1e-9
 
-    for segment_index, (start_wp, end_wp) in enumerate(
-        zip(waypoints[:-1], waypoints[1:]),
-        start=1,
-    ):
-        angle = rotation_error_rad(start_wp.orientation, end_wp.orientation)
-        orientation_steps = max(
-            1,
-            int(math.ceil(angle / max(max_orientation_step_rad, 1.0e-4))),
-        )
-        position_path, arc_radius, chosen_arc_side = build_tool_translation_path(
-            start_wp.position_m,
-            end_wp.position_m,
-            sagitta_m=arc_sagitta_m,
-            step_m=max_cartesian_step_m,
-            arc_side=arc_side,
-            min_radius_m=arc_min_radius_m,
-        )
-        if len(position_path) < orientation_steps:
-            position_path, arc_radius, chosen_arc_side = build_tool_translation_path(
-                start_wp.position_m,
-                end_wp.position_m,
-                sagitta_m=arc_sagitta_m,
-                step_m=max_cartesian_step_m * len(position_path) / orientation_steps,
-                arc_side=arc_side,
-                min_radius_m=arc_min_radius_m,
-            )
-        num_steps = len(position_path)
-        path_length = float(
-            np.sum(np.linalg.norm(np.diff(
-                np.vstack([start_wp.position_m, position_path]),
-                axis=0,
-            ), axis=1))
-        )
-        print(
-            f"Streaming {start_wp.label}->{end_wp.label}:",
-            f"{num_steps} samples",
-            f"| path {path_length:.4f} m",
-            f"| rotation {angle:.4f} rad",
-            f"| xy_arc_radius {arc_radius:.4f} m",
-            f"| min_xy_radius {min_xy_radius(position_path):.4f} m",
-            f"| arc_side {chosen_arc_side}",
+    for sample_index, sample in enumerate(cartesian_path.samples, start=1):
+        loop_time += DT
+        time.sleep(
+            max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
         )
 
-        for step_index, commanded_position in enumerate(position_path, start=1):
-            loop_time += DT
-            time.sleep(
-                max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
-            )
-
-            u = step_index / num_steps
-            s = 3.0 * u * u - 2.0 * u * u * u
-            commanded_orientation = slerp_orientation(
-                start_wp.orientation,
-                end_wp.orientation,
-                s,
-            )
-            set_cartesian_goal(redis_client, commanded_position, commanded_orientation)
-
-            current_position, current_orientation = read_cartesian_pose(redis_client)
-            pos_err = position_error(current_position, end_wp.position_m)
-            ori_err = rotation_error_rad(current_orientation, end_wp.orientation)
-
-            if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
-                print(
-                    "STREAMING_TOOL_CARTESIAN",
-                    "| segment:",
-                    f"{segment_index}/{len(waypoints) - 1}",
-                    "| target:",
-                    end_wp.label,
-                    "| sample:",
-                    f"{step_index}/{num_steps}",
-                    "| pos_error:",
-                    round(pos_err, 5),
-                    "| ori_error_rad:",
-                    round(ori_err, 5),
+        active_segment_index = 1
+        segment_step_index = sample_index
+        segment_num_steps = len(cartesian_path.samples)
+        target_wp = active_waypoints[-1]
+        for candidate_index, (start_index, end_index, summary) in enumerate(
+            segment_ranges,
+            start=1,
+        ):
+            if start_index <= sample_index <= end_index:
+                active_segment_index = candidate_index
+                segment_step_index = sample_index - start_index + 1
+                segment_num_steps = end_index - start_index + 1
+                target_wp = waypoint_by_label.get(
+                    str(summary.get("end_label")),
+                    active_waypoints[-1],
                 )
-                last_status = loop_time
+                break
 
-            if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
-                print(f"Timed out while streaming to {end_wp.label}.")
-                print("Final position error:", round(pos_err, 5))
-                print("Final orientation error rad:", round(ori_err, 5))
-                return False
+        set_cartesian_goal(redis_client, sample.position_m, sample.orientation)
 
-    final_wp = waypoints[-1]
+        current_position, current_orientation = read_cartesian_pose(redis_client)
+        pos_err = position_error(current_position, target_wp.position_m)
+        ori_err = rotation_error_rad(current_orientation, target_wp.orientation)
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                "STREAMING_TOOL_CARTESIAN",
+                "| segment:",
+                f"{active_segment_index}/{segment_count}",
+                "| target:",
+                target_wp.label,
+                "| sample:",
+                f"{segment_step_index}/{segment_num_steps}",
+                "| pos_error:",
+                round(pos_err, 5),
+                "| ori_error_rad:",
+                round(ori_err, 5),
+            )
+            last_status = loop_time
+
+        if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+            print(f"Timed out while streaming to {target_wp.label}.")
+            print("Final position error:", round(pos_err, 5))
+            print("Final orientation error rad:", round(ori_err, 5))
+            return False
+
+    final_wp = active_waypoints[-1]
     set_cartesian_goal(redis_client, final_wp.position_m, final_wp.orientation)
     while True:
         current_position, current_orientation = read_cartesian_pose(redis_client)
@@ -665,28 +1244,56 @@ def approach_tool_init_cartesian(
     arc_side: str = TOOL_ARC_SIDE,
     status_period_s: float = STATUS_PERIOD_S,
     timeout_s: float = TIMEOUT_PER_WAYPOINT_S,
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+    use_cached_path: bool = True,
+    rebuild_path: bool = False,
+    save_path: bool = False,
+    require_cached_path: bool = True,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """INIT_POS -> TOOL_WP1 -> TOOL_WP2 -> TOOL_INIT as Cartesian poses."""
     cfg = load_demo_day_config()
-    init_pos = load_init_pos_m(cfg)
     current_position, current_orientation = read_cartesian_pose(redis_client)
+    cached_path = (
+        load_saved_tool_init_cartesian_path(path_json=path_json)
+        if use_cached_path and not rebuild_path
+        else None
+    )
+    cached_start_wp = (
+        cached_path.source_waypoints[0]
+        if cached_path is not None and cached_path.source_waypoints
+        else None
+    )
+    init_pos = (
+        cached_start_wp.position_m
+        if cached_start_wp is not None
+        else load_init_pos_m(cfg)
+    )
+    init_orientation = (
+        cached_start_wp.orientation
+        if cached_start_wp is not None
+        else current_orientation
+    )
 
     print("Moving to INIT_POS before Cartesian tool path.")
     print("Current Cartesian position:", np.round(current_position, 5))
     print("INIT_POS target:", np.round(init_pos, 5))
+    if cached_start_wp is not None:
+        print("Using cached path INIT_POS pose from:", path_json)
 
     set_cartesian_goal(redis_client, current_position, current_orientation)
     set_active_controller(redis_client, CARTESIAN_CONTROLLER)
     print("Using controller:", CARTESIAN_CONTROLLER)
 
-    if not go_to_waypoint(
+    if not go_to_pose_waypoint(
         redis_client,
         target_pos=init_pos,
-        hold_orientation=current_orientation,
+        target_orientation=init_orientation,
         label="INIT_POS",
         dwell_s=dwell_at_init_s,
         timeout_s=timeout_s,
         status_period_s=status_period_s,
+        pos_tol_m=pos_tol_m,
+        ori_tol_rad=min(ori_tol_rad, CACHED_TOOL_PATH_START_ORI_TOL_RAD),
     ):
         return None
 
@@ -708,13 +1315,117 @@ def approach_tool_init_cartesian(
         arc_side=arc_side,
         status_period_s=status_period_s,
         timeout_s=timeout_s,
+        path_json=path_json,
+        use_cached_path=use_cached_path,
+        rebuild_path=rebuild_path,
+        save_path=save_path,
+        require_cached_path=require_cached_path,
     ):
         return None
 
-    final_wp = pose_waypoints[-1]
     if dwell_at_tool_init_s > 0.0:
         time.sleep(dwell_at_tool_init_s)
-    return final_wp.position_m, final_wp.orientation
+    return read_cartesian_pose(redis_client)
+
+
+def return_from_tool_init_cartesian(
+    redis_client,
+    *,
+    pos_tol_m: float = POS_TOL_M,
+    ori_tol_rad: float = ORI_TOL_RAD,
+    status_period_s: float = STATUS_PERIOD_S,
+    timeout_s: float = TIMEOUT_PER_WAYPOINT_S,
+    path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+) -> bool:
+    """TOOL_INIT -> INIT_POS by replaying the cached Cartesian path in reverse."""
+    cartesian_path = load_saved_tool_init_cartesian_path(path_json=path_json)
+    if cartesian_path is None:
+        print(f"Could not load cached Cartesian TOOL_INIT return path: {path_json}")
+        return False
+    if not cartesian_path.source_waypoints:
+        print("Cached Cartesian TOOL_INIT path is missing source waypoints.")
+        return False
+
+    final_wp = cartesian_path.source_waypoints[0]
+    tool_init_wp = cartesian_path.source_waypoints[-1]
+    reverse_samples = list(reversed(cartesian_path.samples[:-1]))
+
+    current_position, current_orientation = read_cartesian_pose(redis_client)
+    start_pos_err = position_error(current_position, tool_init_wp.position_m)
+    start_ori_err = rotation_error_rad(current_orientation, tool_init_wp.orientation)
+    print("\nCartesian TOOL_INIT return path:")
+    print("  source JSON:", path_json)
+    print("  TOOL_INIT start error m:", round(start_pos_err, 5))
+    print("  TOOL_INIT start orientation error rad:", round(start_ori_err, 5))
+    print("  reverse samples:", len(reverse_samples))
+
+    set_cartesian_goal(redis_client, current_position, current_orientation)
+    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
+    print("Using controller:", CARTESIAN_CONTROLLER)
+
+    loop_time = 0.0
+    last_status = 0.0
+    start_time = time.perf_counter()
+    time.sleep(0.01)
+    init_time = time.perf_counter_ns() * 1e-9
+
+    for sample_index, sample in enumerate(reverse_samples, start=1):
+        loop_time += DT
+        time.sleep(
+            max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time))
+        )
+        set_cartesian_goal(redis_client, sample.position_m, sample.orientation)
+
+        current_position, current_orientation = read_cartesian_pose(redis_client)
+        pos_err = position_error(current_position, final_wp.position_m)
+        ori_err = rotation_error_rad(current_orientation, final_wp.orientation)
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                "STREAMING_TOOL_CARTESIAN_RETURN",
+                "| sample:",
+                f"{sample_index}/{len(reverse_samples)}",
+                "| pos_error:",
+                round(pos_err, 5),
+                "| ori_error_rad:",
+                round(ori_err, 5),
+            )
+            last_status = loop_time
+
+        if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+            print("Timed out while streaming Cartesian TOOL_INIT return path.")
+            print("Final position error:", round(pos_err, 5))
+            print("Final orientation error rad:", round(ori_err, 5))
+            return False
+
+    set_cartesian_goal(redis_client, final_wp.position_m, final_wp.orientation)
+    while True:
+        current_position, current_orientation = read_cartesian_pose(redis_client)
+        pos_err = position_error(current_position, final_wp.position_m)
+        ori_err = rotation_error_rad(current_orientation, final_wp.orientation)
+        if pos_err < pos_tol_m and ori_err < ori_tol_rad:
+            print(f"Reached {final_wp.label} via cached Cartesian return path.")
+            return True
+
+        if status_period_s <= 0.0 or loop_time - last_status >= status_period_s:
+            print(
+                "SETTLING_TOOL_CARTESIAN_RETURN",
+                "| pos_error:",
+                round(pos_err, 5),
+                "| ori_error_rad:",
+                round(ori_err, 5),
+            )
+            last_status = loop_time
+
+        if timeout_s > 0.0 and time.perf_counter() - start_time > timeout_s:
+            print("Timed out settling after Cartesian TOOL_INIT return path.")
+            print("Final position error:", round(pos_err, 5))
+            print("Final orientation error rad:", round(ori_err, 5))
+            return False
+
+        set_cartesian_goal(redis_client, final_wp.position_m, final_wp.orientation)
+        time.sleep(DT)
+        loop_time += DT
 
 
 # ---------------------------------------------------------------------------

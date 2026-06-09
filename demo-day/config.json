@@ -1,7 +1,16 @@
 {
   "units": "meters",
   "init_pos_m": [0.55, 0.11226, 0.3151],
-  "canvas_corner_x_offset_m": -0.025,
+  "canvas_corner_x_offset_m": -0.003,
+  "actual_canvas_size_m": 0.254,
+  "canvas_border_horizontal_offset_m": -0.025,
+  "canvas_border_vertical_offset_m": 0.0,
+  "canvas_corner_correction_offsets_m": {
+    "TL": [-0.03455, 0.00456, 0.01509],
+    "TR": [-0.02679, 0.02031, 0.01636],
+    "BR": [-0.02124, 0.01564, 0.02603],
+    "BL": [-0.02581, 0.00453, 0.02025]
+  },
   "TOOL_INIT": [34.96, -74.35, 110.53, 99.86, 0.50, 48.48, 115.66],
   "TOOL_INIT_POS": [-32.44, -541.06, 400.20],
   "TOOL_INIT_ORI": [-45.18, -90.01, 45.52],
@@ -20,22 +29,24 @@
   "TOOL_SAFE_APPROACH_2": [27.57, -67.09, 87.16, 97.78, 0.39, 46.69, 91.21],
 
 
-  "paint_station_y_offset_m": -0.015,
-  "paint_swirl_diameter_mm": 35.0,
+  "paint_station_y_offset_m": -0.014,
+  "paint_swirl_diameter_mm": 45.0,
   "paint_swirl_revolutions": 3,
 
   "P1_INIT_POS": [113.3, -532.82, 264.91],
   "P2_INIT_POS": [52.40, -532.82, 264.91],
   "P3_INIT_POS": [-6.07, -532.82, 264.91],
   "WATER_INIT_POS": [-79.60, -523.02, 264.91],
-  "z_dive_in_offset_mm": -86.0,
-  "swirl_diameter_mm": 70.0,
+  "z_dive_in_offset_mm": -96.0,
+  "swirl_diameter_mm": 75.0,
 
   "WATER_TO_NAPKIN_INIT_POS": [-79.60, -523.02, 370.91],
   "NAPKIN_LIFT1_POS": [-277.76, -515.62, 370.91],
-  "NAPKIN_S1_POS": [-277.76, -515.62, 294.80],
+  "NAPKIN_S1_POS": [-277.76, -515.62, 285.80],
   "NAPKIN_LIFT2_POS": [-277.76, -573.07, 370.91],
-  "NAPKIN_S2_POS": [-277.76, -573.07, 294.80]
+  "NAPKIN_S2_POS": [-277.76, -573.07, 285.80],
+
+  "CANVAS_PADDING": 0.024
 
   
 

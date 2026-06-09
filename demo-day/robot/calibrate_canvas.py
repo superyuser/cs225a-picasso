@@ -1,7 +1,8 @@
 """Calibrate canvas corners using AprilTags seen from the wrist camera.
 
 Flow:
-    1. Send the robot to INIT_POS so the camera is at a known pose.
+    1. Send the robot to CALIBRATION_CAMERA_INIT_POS, an offset from INIT_POS
+       chosen so all four tags are visible to the wrist camera.
     2. Open the USB camera (same logic as demo-day/robot/orient_camera.py).
     3. Detect 4 AprilTags (tag36h11 family) with IDs 0, 1, 2, 3 -- the
        canvas corners TL, TR, BR, BL. Each tag is a 35 mm black square.
@@ -9,9 +10,11 @@ Flow:
        cv2.solvePnP with known tag geometry + camera intrinsics.
     5. Transform from the camera frame into the brush-tip frame using the
        fixed camera-on-tip offset (-75.60, 0.0, +42.11 mm) and an assumed
-       camera-mount rotation. Output XYZ distances from the tip to each
-       corner.
-    6. Save the calibration JSON for downstream robot use.
+       camera-mount rotation.
+    6. Use the detected AprilTag board plane to place the actual 10 in x 10 in
+       raised canvas centered in that plane, with the configured -X surface
+       offset applied.
+    7. Save the calibration JSON for downstream robot use.
 
 This script lives in demo-day/robot/ and is fully self-contained: it does
 not import from the sibling robot/ package, mirroring the style of
@@ -56,6 +59,10 @@ controller_to_use = "cartesian_controller"
 DT = 0.01                            # 100 Hz main loop
 POS_TOL_M = 1.0e-2                   # 10 mm position tolerance
 DWELL_AT_INIT_S = 0.5
+CALIBRATION_INIT_X_OFFSET_M = -0.15
+INCH_TO_M = 0.0254
+DEFAULT_ACTUAL_CANVAS_SIZE_M = 10.0 * INCH_TO_M
+CORNER_ORDER = ("TL", "TR", "BR", "BL")
 
 # Robot "home" pose is sourced from demo-day/config.json so all demo-day
 # scripts share a single source of truth.
@@ -63,13 +70,90 @@ _SCRIPT_DIR_FOR_INIT = Path(__file__).resolve().parent
 _DEMO_DAY_CONFIG_PATH = _SCRIPT_DIR_FOR_INIT.parent / "config.json"
 
 
-def _load_init_pos() -> np.ndarray:
+def _load_demo_day_config() -> dict:
     with _DEMO_DAY_CONFIG_PATH.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+        return json.load(f)
+
+
+_DEMO_DAY_CONFIG = _load_demo_day_config()
+
+
+def _load_init_pos(config: dict | None = None) -> np.ndarray:
+    cfg = config or _DEMO_DAY_CONFIG
     return np.array(cfg["init_pos_m"], dtype=float)
 
 
-INIT_POS = _load_init_pos()
+def _load_canvas_padding_m(config: dict | None = None) -> float:
+    cfg = config or _DEMO_DAY_CONFIG
+    padding_m = float(cfg.get("CANVAS_PADDING", 0.0))
+    if padding_m < 0.0:
+        raise ValueError(f"CANVAS_PADDING must be non-negative, got {padding_m}")
+    return padding_m
+
+
+def _load_canvas_surface_x_offset_m(config: dict | None = None) -> float:
+    cfg = config or _DEMO_DAY_CONFIG
+    return float(cfg.get("canvas_corner_x_offset_m", -0.016))
+
+
+def _load_actual_canvas_size_m(config: dict | None = None) -> float:
+    cfg = config or _DEMO_DAY_CONFIG
+    size_m = float(cfg.get("actual_canvas_size_m", DEFAULT_ACTUAL_CANVAS_SIZE_M))
+    if size_m <= 0.0:
+        raise ValueError(f"actual_canvas_size_m must be positive, got {size_m}")
+    return size_m
+
+
+def _load_canvas_border_horizontal_offset_m(config: dict | None = None) -> float:
+    cfg = config or _DEMO_DAY_CONFIG
+    return float(cfg.get("canvas_border_horizontal_offset_m", 0.0))
+
+
+def _load_canvas_border_vertical_offset_m(config: dict | None = None) -> float:
+    cfg = config or _DEMO_DAY_CONFIG
+    return float(cfg.get("canvas_border_vertical_offset_m", 0.0))
+
+
+def _parse_corner_offsets(raw, *, key_name: str) -> dict[str, np.ndarray]:
+    offsets = {name: np.zeros(3, dtype=float) for name in CORNER_ORDER}
+    if raw is None:
+        return offsets
+    if not isinstance(raw, dict):
+        raise ValueError(f"{key_name} must be an object keyed by TL/TR/BR/BL.")
+
+    for name, value in raw.items():
+        if name not in offsets:
+            raise ValueError(f"{key_name} contains unknown corner {name!r}.")
+        vec = np.array(value, dtype=float)
+        if vec.shape != (3,):
+            raise ValueError(f"{key_name}.{name} must be an [x, y, z] vector in meters.")
+        offsets[name] = vec
+    return offsets
+
+
+def _load_canvas_corner_correction_offsets_m(config: dict | None = None) -> dict[str, np.ndarray]:
+    cfg = config or _DEMO_DAY_CONFIG
+    return _parse_corner_offsets(
+        cfg.get("canvas_corner_correction_offsets_m", {}),
+        key_name="canvas_corner_correction_offsets_m",
+    )
+
+
+INIT_POS = _load_init_pos(_DEMO_DAY_CONFIG)
+CALIBRATION_CAMERA_INIT_POS = (
+    INIT_POS + np.array([CALIBRATION_INIT_X_OFFSET_M, 0.0, 0.0], dtype=float)
+)
+CALIBRATION_INIT_POS = CALIBRATION_CAMERA_INIT_POS
+CANVAS_PADDING_M = _load_canvas_padding_m(_DEMO_DAY_CONFIG)
+CANVAS_SURFACE_X_OFFSET_M = _load_canvas_surface_x_offset_m(_DEMO_DAY_CONFIG)
+ACTUAL_CANVAS_SIZE_M = _load_actual_canvas_size_m(_DEMO_DAY_CONFIG)
+CANVAS_BORDER_HORIZONTAL_OFFSET_M = _load_canvas_border_horizontal_offset_m(
+    _DEMO_DAY_CONFIG
+)
+CANVAS_BORDER_VERTICAL_OFFSET_M = _load_canvas_border_vertical_offset_m(
+    _DEMO_DAY_CONFIG
+)
+CANVAS_CORNER_CORRECTION_OFFSETS_M = _load_canvas_corner_correction_offsets_m(_DEMO_DAY_CONFIG)
 
 
 @dataclass
@@ -136,23 +220,22 @@ PREVIEW_WINDOW = "Canvas Calibration"
 TAG_SIZE_M = 0.035                    # 35 mm black square
 TAG_DICT = cv2.aruco.DICT_APRILTAG_36h11
 TAG_ID_TO_CORNER = {0: "TL", 1: "TR", 2: "BR", 3: "BL"}
-CORNER_ORDER = ("TL", "TR", "BR", "BL")
 
-# Which specific corner of each tag corresponds to the physical canvas
-# corner we want. Each entry is the (sign_x, sign_y) of the corner in the
+# Which specific corner of each tag corresponds to the AprilTag board corner
+# we want. Each entry is the (sign_x, sign_y) of the corner in the
 # tag's own local frame (x: right, y: up, z: out of the tag face) -- the
 # point will be (sx * s, sy * s, 0) with s = TAG_SIZE_M / 2.
 #
 # Layout (looking at the canvas, tags right-side-up):
-#   TL canvas corner  <- bottom-right corner of TL tag  (+x, -y)
-#   TR canvas corner  <- bottom-left  corner of TR tag  (-x, -y)
-#   BR canvas corner  <- bottom-left  corner of BR tag  (-x, -y)
-#   BL canvas corner  <- bottom-right corner of BL tag  (+x, -y)
+#   TL board corner   <- bottom-right corner of TL tag  (+x, -y)
+#   TR board corner   <- bottom-left  corner of TR tag  (-x, -y)
+#   BR board corner   <- top-left     corner of BR tag  (-x, +y)
+#   BL board corner   <- top-right    corner of BL tag  (+x, +y)
 TAG_LOCAL_CORNER_SIGNS = {
     "TL": (+1.0, -1.0),
     "TR": (-1.0, -1.0),
-    "BR": (-1.0, -1.0),
-    "BL": (+1.0, -1.0),
+    "BR": (-1.0, +1.0),
+    "BL": (+1.0, +1.0),
 }
 
 # Camera mounted behind+above the brush tip.
@@ -318,6 +401,167 @@ def camera_to_tip(p_camera: np.ndarray) -> np.ndarray:
     return R_CAM_TO_TIP @ np.asarray(p_camera, dtype=float) + CAMERA_OFFSET_IN_TIP_FRAME_M
 
 
+def _normalize(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm < 1.0e-9:
+        raise ValueError("Cannot normalize near-zero vector while insetting canvas corners.")
+    return vec / norm
+
+
+def _ordered_points(corners: dict[str, np.ndarray]) -> np.ndarray:
+    return np.array([corners[name] for name in CORNER_ORDER], dtype=float)
+
+
+def _format_corners(corners: dict[str, np.ndarray]) -> dict[str, list[float]]:
+    return {
+        name: [round(float(v), 5) for v in corners[name]]
+        for name in CORNER_ORDER
+    }
+
+
+def _canvas_plane_basis(corners: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points = _ordered_points(corners)
+    origin = points[0]
+
+    normal = np.zeros(3, dtype=float)
+    for index, point in enumerate(points):
+        next_point = points[(index + 1) % len(points)]
+        normal += np.cross(point, next_point)
+    normal = _normalize(normal)
+
+    x_axis = _normalize(corners["TR"] - corners["TL"])
+    y_axis = _normalize(np.cross(normal, x_axis))
+    return origin, x_axis, y_axis
+
+
+def _line_intersection_2d(
+    first_point: np.ndarray,
+    first_direction: np.ndarray,
+    second_point: np.ndarray,
+    second_direction: np.ndarray,
+) -> np.ndarray:
+    system = np.column_stack((first_direction, -second_direction))
+    rhs = second_point - first_point
+    det = float(np.linalg.det(system))
+    if abs(det) < 1.0e-9:
+        raise ValueError("Canvas corner inset failed because adjacent edges are parallel.")
+    t, _u = np.linalg.solve(system, rhs)
+    return first_point + t * first_direction
+
+
+def inset_canvas_corners(
+    corners: dict[str, np.ndarray],
+    padding_m: float,
+) -> dict[str, np.ndarray]:
+    """Inset ordered TL/TR/BR/BL corners by ``padding_m`` within their plane."""
+    if padding_m <= 0.0:
+        return {name: np.array(corners[name], dtype=float) for name in CORNER_ORDER}
+
+    origin, x_axis, y_axis = _canvas_plane_basis(corners)
+    points_2d = []
+    for name in CORNER_ORDER:
+        rel = np.array(corners[name], dtype=float) - origin
+        points_2d.append(np.array([np.dot(rel, x_axis), np.dot(rel, y_axis)], dtype=float))
+
+    offset_points: list[np.ndarray] = []
+    offset_directions: list[np.ndarray] = []
+    for index, point in enumerate(points_2d):
+        next_point = points_2d[(index + 1) % len(points_2d)]
+        edge = next_point - point
+        edge_len = float(np.linalg.norm(edge))
+        if edge_len <= 2.0 * padding_m:
+            raise ValueError(
+                f"CANVAS_PADDING={padding_m:.4f} m is too large for canvas edge "
+                f"{CORNER_ORDER[index]}->{CORNER_ORDER[(index + 1) % len(CORNER_ORDER)]} "
+                f"with length {edge_len:.4f} m."
+            )
+        direction = edge / edge_len
+        inward_normal = np.array([-direction[1], direction[0]], dtype=float)
+        offset_points.append(point + inward_normal * padding_m)
+        offset_directions.append(direction)
+
+    inset_points_2d: list[np.ndarray] = []
+    for index in range(len(points_2d)):
+        prev_index = (index - 1) % len(points_2d)
+        inset_points_2d.append(
+            _line_intersection_2d(
+                offset_points[prev_index],
+                offset_directions[prev_index],
+                offset_points[index],
+                offset_directions[index],
+            )
+        )
+
+    inset_corners = {}
+    for name, point_2d in zip(CORNER_ORDER, inset_points_2d):
+        inset_corners[name] = origin + point_2d[0] * x_axis + point_2d[1] * y_axis
+    return inset_corners
+
+
+def centered_actual_canvas_corners(
+    board_corners: dict[str, np.ndarray],
+    *,
+    canvas_size_m: float,
+    surface_x_offset_m: float,
+) -> dict[str, np.ndarray]:
+    """Place the physical square canvas centered in the detected board plane."""
+    points = _ordered_points(board_corners)
+    center = points.mean(axis=0)
+
+    top_mid = 0.5 * (board_corners["TL"] + board_corners["TR"])
+    bottom_mid = 0.5 * (board_corners["BL"] + board_corners["BR"])
+    right_axis = _normalize(board_corners["TR"] - board_corners["TL"])
+    down_raw = bottom_mid - top_mid
+    normal = _normalize(np.cross(right_axis, down_raw))
+    down_axis = _normalize(np.cross(normal, right_axis))
+    if float(np.dot(down_axis, down_raw)) < 0.0:
+        down_axis = -down_axis
+
+    half = canvas_size_m / 2.0
+    surface_offset = np.array([surface_x_offset_m, 0.0, 0.0], dtype=float)
+    return {
+        "TL": center - half * right_axis - half * down_axis + surface_offset,
+        "TR": center + half * right_axis - half * down_axis + surface_offset,
+        "BR": center + half * right_axis + half * down_axis + surface_offset,
+        "BL": center - half * right_axis + half * down_axis + surface_offset,
+    }
+
+
+def apply_corner_correction_offsets(
+    corners: dict[str, np.ndarray],
+    correction_offsets: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    return {
+        name: (
+            np.array(corners[name], dtype=float)
+            + np.array(correction_offsets[name], dtype=float)
+        )
+        for name in CORNER_ORDER
+    }
+
+
+def apply_canvas_border_offset(
+    corners: dict[str, np.ndarray],
+    *,
+    horizontal_offset_m: float,
+    vertical_offset_m: float,
+) -> dict[str, np.ndarray]:
+    """Shift every corner in the canvas plane.
+
+    Positive horizontal moves from TL toward TR. Positive vertical moves from
+    TL toward BL.
+    """
+    if abs(horizontal_offset_m) < 1.0e-12 and abs(vertical_offset_m) < 1.0e-12:
+        return {name: np.array(corners[name], dtype=float) for name in CORNER_ORDER}
+
+    right_axis = _normalize(corners["TR"] - corners["TL"])
+    top_mid = 0.5 * (corners["TL"] + corners["TR"])
+    bottom_mid = 0.5 * (corners["BL"] + corners["BR"])
+    down_axis = _normalize(bottom_mid - top_mid)
+    shift = horizontal_offset_m * right_axis + vertical_offset_m * down_axis
+    return {name: np.array(corners[name], dtype=float) + shift for name in CORNER_ORDER}
+
+
 # ============================================================
 # OVERLAY
 # ============================================================
@@ -360,9 +604,13 @@ def ensure_robot_ready(redis_client) -> bool:
 def move_to_init(redis_client, dwell_s: float = DWELL_AT_INIT_S) -> bool:
     current = read_np(redis_client, redis_keys.cartesian_task_current_position, (3,))
     print("Current position:", current)
-    print("Target INIT:    ", INIT_POS)
+    print("INIT_POS:       ", INIT_POS)
+    print(
+        f"Calibration camera INIT target with X offset {CALIBRATION_INIT_X_OFFSET_M:+.3f} m:",
+        CALIBRATION_CAMERA_INIT_POS,
+    )
 
-    send_position(redis_client, INIT_POS)
+    send_position(redis_client, CALIBRATION_CAMERA_INIT_POS)
     loop_time = 0.0
     time.sleep(0.01)
     init_time = time.perf_counter_ns() * 1e-9
@@ -370,13 +618,13 @@ def move_to_init(redis_client, dwell_s: float = DWELL_AT_INIT_S) -> bool:
     while True:
         loop_time += DT
         time.sleep(max(0.0, loop_time - (time.perf_counter_ns() * 1e-9 - init_time)))
-        send_position(redis_client, INIT_POS)
+        send_position(redis_client, CALIBRATION_CAMERA_INIT_POS)
         current = read_np(redis_client, redis_keys.cartesian_task_current_position, (3,))
-        err = position_error(current, INIT_POS)
+        err = position_error(current, CALIBRATION_CAMERA_INIT_POS)
         print(f"MOVE_TO_INIT | pos_error: {err:.5f}")
         if err < POS_TOL_M:
             break
-    print(f"Reached INIT. Dwelling {dwell_s:.2f}s.")
+    print(f"Reached calibration camera INIT target. Dwelling {dwell_s:.2f}s.")
     time.sleep(dwell_s)
     return True
 
@@ -495,14 +743,49 @@ def capture_corners(
 
 def build_output_payload(capture_result, robot_pos_at_capture, robot_ori_at_capture):
     cam_corners = capture_result["corners_in_camera_frame_m"]
-    tip_corners = {name: camera_to_tip(p) for name, p in cam_corners.items()}
+    plane_tip_corners = {name: camera_to_tip(p) for name, p in cam_corners.items()}
+    capture_origin = (
+        np.array(robot_pos_at_capture, dtype=float)
+        if robot_pos_at_capture is not None
+        else CALIBRATION_CAMERA_INIT_POS
+    )
 
-    # World-frame corner positions: the tip is assumed to sit at INIT_POS when
-    # calibration runs, with tip-frame axes aligned to the world frame. Then
-    # the world position of each canvas corner is simply:
-    #   corner_world = INIT_POS + corner_in_tip_frame
-    world_corners = {
-        name: INIT_POS + tip_corners[name] for name in CORNER_ORDER
+    # World-frame corner positions: the tip is assumed to sit at the actual
+    # calibration capture pose, with tip-frame axes aligned to the world frame.
+    # Then the world position of each canvas corner is simply:
+    #   corner_world = capture_origin + corner_in_tip_frame
+    plane_world_corners = {
+        name: capture_origin + plane_tip_corners[name] for name in CORNER_ORDER
+    }
+
+    actual_canvas_uncorrected_world_corners = centered_actual_canvas_corners(
+        plane_world_corners,
+        canvas_size_m=ACTUAL_CANVAS_SIZE_M,
+        surface_x_offset_m=CANVAS_SURFACE_X_OFFSET_M,
+    )
+    actual_canvas_corrected_world_corners = apply_corner_correction_offsets(
+        actual_canvas_uncorrected_world_corners,
+        CANVAS_CORNER_CORRECTION_OFFSETS_M,
+    )
+    actual_canvas_world_corners = apply_canvas_border_offset(
+        actual_canvas_corrected_world_corners,
+        horizontal_offset_m=CANVAS_BORDER_HORIZONTAL_OFFSET_M,
+        vertical_offset_m=CANVAS_BORDER_VERTICAL_OFFSET_M,
+    )
+    actual_canvas_uncorrected_tip_corners = {
+        name: actual_canvas_uncorrected_world_corners[name] - capture_origin
+        for name in CORNER_ORDER
+    }
+    actual_canvas_tip_corners = {
+        name: actual_canvas_world_corners[name] - capture_origin for name in CORNER_ORDER
+    }
+    drawable_canvas_world_corners = inset_canvas_corners(
+        actual_canvas_world_corners,
+        CANVAS_PADDING_M,
+    )
+    drawable_canvas_tip_corners = {
+        name: drawable_canvas_world_corners[name] - capture_origin
+        for name in CORNER_ORDER
     }
 
     payload = {
@@ -513,6 +796,14 @@ def build_output_payload(capture_result, robot_pos_at_capture, robot_ori_at_capt
             name: list(TAG_LOCAL_CORNER_SIGNS[name]) for name in CORNER_ORDER
         },
         "tag_size_m": TAG_SIZE_M,
+        "canvas_padding_m": CANVAS_PADDING_M,
+        "actual_canvas_size_m": ACTUAL_CANVAS_SIZE_M,
+        "actual_canvas_surface_x_offset_m": CANVAS_SURFACE_X_OFFSET_M,
+        "canvas_border_horizontal_offset_m": CANVAS_BORDER_HORIZONTAL_OFFSET_M,
+        "canvas_border_vertical_offset_m": CANVAS_BORDER_VERTICAL_OFFSET_M,
+        "canvas_border_offset_applied": True,
+        "actual_canvas_correction_offsets_m": _format_corners(CANVAS_CORNER_CORRECTION_OFFSETS_M),
+        "actual_canvas_correction_offsets_applied": True,
         "camera_offset_in_tip_frame_m": CAMERA_OFFSET_IN_TIP_FRAME_M.tolist(),
         "R_camera_to_tip": R_CAM_TO_TIP.tolist(),
         "intrinsics_calibrated": bool(capture_result["intrinsics_calibrated"]),
@@ -520,6 +811,10 @@ def build_output_payload(capture_result, robot_pos_at_capture, robot_ori_at_capt
         "dist_coeffs": capture_result["dist"].tolist(),
         "frame_size_px": list(capture_result["frame_size"]),
         "robot_init_position_m": INIT_POS.tolist(),
+        "calibration_init_x_offset_m": CALIBRATION_INIT_X_OFFSET_M,
+        "calibration_camera_init_position_m": CALIBRATION_CAMERA_INIT_POS.tolist(),
+        "calibration_init_target_m": CALIBRATION_CAMERA_INIT_POS.tolist(),
+        "calibration_capture_origin_m": capture_origin.tolist(),
         "robot_position_at_capture_m": (
             robot_pos_at_capture.tolist() if robot_pos_at_capture is not None else None
         ),
@@ -530,16 +825,22 @@ def build_output_payload(capture_result, robot_pos_at_capture, robot_ori_at_capt
             name: [round(float(v), 5) for v in cam_corners[name]]
             for name in CORNER_ORDER
         },
-        "corners_in_tip_frame_m": {
-            name: [round(float(v), 5) for v in tip_corners[name]]
-            for name in CORNER_ORDER
-        },
-        "corners_in_world_frame_m": {
-            name: [round(float(v), 5) for v in world_corners[name]]
-            for name in CORNER_ORDER
-        },
+        "canvas_plane_corners_in_tip_frame_m": _format_corners(plane_tip_corners),
+        "canvas_plane_corners_in_world_frame_m": _format_corners(plane_world_corners),
+        "actual_canvas_uncorrected_corners_in_tip_frame_m": _format_corners(
+            actual_canvas_uncorrected_tip_corners
+        ),
+        "actual_canvas_uncorrected_corners_in_world_frame_m": _format_corners(
+            actual_canvas_uncorrected_world_corners
+        ),
+        "actual_canvas_corners_in_tip_frame_m": _format_corners(actual_canvas_tip_corners),
+        "actual_canvas_corners_in_world_frame_m": _format_corners(actual_canvas_world_corners),
+        "drawable_corners_in_tip_frame_m": _format_corners(drawable_canvas_tip_corners),
+        "drawable_corners_in_world_frame_m": _format_corners(drawable_canvas_world_corners),
+        "corners_in_tip_frame_m": _format_corners(drawable_canvas_tip_corners),
+        "corners_in_world_frame_m": _format_corners(drawable_canvas_world_corners),
         "tip_to_corner_distance_m": {
-            name: round(float(np.linalg.norm(tip_corners[name])), 5)
+            name: round(float(np.linalg.norm(drawable_canvas_tip_corners[name])), 5)
             for name in CORNER_ORDER
         },
         "captured_at": datetime.now().isoformat(timespec="seconds"),
@@ -555,9 +856,32 @@ def print_summary(payload):
     if not payload["intrinsics_calibrated"]:
         print("(!) Using HFOV-approximated intrinsics -- Z depth is rough.")
     print()
+    print(f"Actual canvas size: {payload['actual_canvas_size_m'] * 1000:.1f} mm")
+    print(
+        "Actual canvas surface X offset: "
+        f"{payload['actual_canvas_surface_x_offset_m'] * 1000:+.1f} mm"
+    )
+    print(
+        "Canvas border planar offset: "
+        f"horizontal {payload.get('canvas_border_horizontal_offset_m', 0.0) * 1000:+.1f} mm, "
+        f"vertical {payload.get('canvas_border_vertical_offset_m', 0.0) * 1000:+.1f} mm"
+    )
+    print(f"Drawable canvas padding: {payload['canvas_padding_m'] * 1000:.1f} mm")
+    correction_offsets = payload.get("actual_canvas_correction_offsets_m", {})
+    if correction_offsets:
+        max_correction_m = max(
+            float(np.linalg.norm(np.array(correction_offsets[name], dtype=float)))
+            for name in CORNER_ORDER
+        )
+        if max_correction_m > 0.0:
+            print(
+                "Actual canvas empirical correction offsets: "
+                f"enabled (max {max_correction_m * 1000:.1f} mm)"
+            )
+    print()
     print(f"{'corner':<6} {'X (mm)':>10} {'Y (mm)':>10} {'Z (mm)':>10}   {'dist (mm)':>10}")
     print("-" * 60)
-    print("Tip-frame offsets (corner relative to brush tip):")
+    print("Drawable canvas tip-frame offsets (corner relative to brush tip):")
     for name in CORNER_ORDER:
         tip = payload["corners_in_tip_frame_m"][name]
         dist = payload["tip_to_corner_distance_m"][name]
@@ -565,7 +889,7 @@ def print_summary(payload):
     world = payload.get("corners_in_world_frame_m")
     if world is not None:
         print()
-        print("World-frame positions (robot base frame, meters):")
+        print("Drawable canvas world-frame positions (robot base frame, meters):")
         print(f"{'corner':<6} {'X (m)':>10} {'Y (m)':>10} {'Z (m)':>10}")
         print("-" * 60)
         for name in CORNER_ORDER:
@@ -584,7 +908,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-index", type=int, default=DEFAULT_CAMERA_INDEX,
                         help=f"OpenCV camera index (default: {DEFAULT_CAMERA_INDEX}).")
     parser.add_argument("--no-move", action="store_true",
-                        help="Skip moving the robot to INIT_POS. Useful for tuning the camera.")
+                        help="Skip moving the robot to the calibration camera INIT target.")
     parser.add_argument("--no-preview", action="store_true",
                         help="Run headless (no OpenCV preview window).")
     parser.add_argument("--intrinsics-json", default=str(DEFAULT_INTRINSICS_JSON),

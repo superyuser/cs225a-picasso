@@ -8,18 +8,7 @@ from typing import Callable
 
 import numpy as np
 
-from .joint_motion import (
-    JOINT_ARRIVAL_THRESHOLD,
-    JOINT_MAX_STEP_DEG,
-    TIMEOUT_S,
-    ToolInitApproachResult,
-    approach_tool_init,
-    follow_joint_path_to_goal,
-    joint_redis_keys,
-    load_demo_day_config,
-    load_tool_init_rad,
-    return_from_tool_init,
-)
+from .joint_motion import JOINT_ARRIVAL_THRESHOLD, JOINT_MAX_STEP_DEG, TIMEOUT_S
 from .primitives import (
     dip_paint_1,
     dip_paint_2,
@@ -31,7 +20,10 @@ from .primitives import (
 from .tool_station_coords import (
     CARTESIAN_SETTLE_S,
     POS_TOL_M,
+    approach_tool_init_cartesian,
     go_to_waypoint,
+    load_demo_day_config,
+    return_from_tool_init_cartesian,
     switch_to_cartesian_hold_current,
 )
 
@@ -140,10 +132,18 @@ def run_paint_change_sequence(
     rebuild_tool_init_path: bool = False,
 ) -> bool:
     """Execute a full paint change starting from the robot home position."""
+    if not use_cached_tool_init_path and not rebuild_tool_init_path:
+        print(
+            "Paint change requires a saved Cartesian TOOL_INIT path for the "
+            "reverse TOOL_INIT -> INIT_POS transition. Use the cached path, or "
+            "pass --rebuild-tool-init-path to regenerate and save it."
+        )
+        return False
+
     paint = normalize_paint_number(paint_number)
     steps = build_paint_change_sequence(paint)
     cfg = load_demo_day_config()
-    approach: ToolInitApproachResult | None = None
+    tool_init_position: np.ndarray | None = None
     hold_orientation: np.ndarray | None = None
     cartesian_ready = False
 
@@ -158,17 +158,20 @@ def run_paint_change_sequence(
 
     for step in steps:
         if step.kind == PaintChangeStepKind.APPROACH_TOOL_INIT:
-            approach = approach_tool_init(
+            tool_init_pose = approach_tool_init_cartesian(
                 redis_client,
-                joint_arrival_threshold=joint_arrival_threshold,
-                joint_max_step_deg=joint_max_step_deg,
+                dwell_at_tool_init_s=hover_dwell_s,
                 status_period_s=status_period_s,
                 timeout_s=timeout_s,
                 use_cached_path=use_cached_tool_init_path,
                 rebuild_path=rebuild_tool_init_path,
+                save_path=rebuild_tool_init_path,
+                require_cached_path=use_cached_tool_init_path and not rebuild_tool_init_path,
             )
-            if approach is None:
+            if tool_init_pose is None:
                 return False
+            tool_init_position, hold_orientation = tool_init_pose
+            cartesian_ready = True
             continue
 
         if not cartesian_ready:
@@ -236,42 +239,29 @@ def run_paint_change_sequence(
             continue
 
         if step.kind == PaintChangeStepKind.GOTO_TOOL_INIT:
-            tool_init_rad = (
-                approach.tool_init_rad if approach is not None else load_tool_init_rad()
-            )
-            current_joint = read_np(
+            if tool_init_position is None:
+                print("Missing TOOL_INIT Cartesian pose; cannot return to TOOL_INIT.")
+                return False
+            if not go_to_waypoint(
                 redis_client,
-                joint_redis_keys.sensor_joint_positions,
-                (7,),
-            )
-            max_joint_step = max(abs(joint_max_step_deg) * (np.pi / 180.0), 1.0e-5)
-            if not follow_joint_path_to_goal(
-                redis_client,
-                start_joint_position=current_joint,
-                goal_joint_position=tool_init_rad,
+                target_pos=tool_init_position,
+                hold_orientation=hold_orientation,
                 label="TOOL_INIT",
-                max_joint_step=max_joint_step,
-                joint_arrival_threshold=joint_arrival_threshold,
+                dwell_s=hover_dwell_s,
+                status_period_s=status_period_s,
+                timeout_s=timeout_s,
+            ):
+                return False
+            continue
+
+        if step.kind == PaintChangeStepKind.RETURN_HOME:
+            if not return_from_tool_init_cartesian(
+                redis_client,
                 status_period_s=status_period_s,
                 timeout_s=timeout_s,
             ):
                 return False
             cartesian_ready = False
-            continue
-
-        if step.kind == PaintChangeStepKind.RETURN_HOME:
-            if approach is None:
-                print("Missing approach path; cannot return home.")
-                return False
-            if not return_from_tool_init(
-                redis_client,
-                approach,
-                joint_arrival_threshold=joint_arrival_threshold,
-                status_period_s=status_period_s,
-                timeout_s=timeout_s,
-                use_cached_path=use_cached_tool_init_path,
-            ):
-                return False
             continue
 
     print(f"\nFinished paint change for paint {paint}.")

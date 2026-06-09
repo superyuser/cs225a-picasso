@@ -54,6 +54,8 @@ from helpers.primitives import (
     wipe_napkin,
 )
 from helpers.tool_station_coords import (
+    CARTESIAN_MAX_ORI_STEP_RAD,
+    DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
     TOOL_ARC_MIN_RADIUS_M,
     TOOL_ARC_SAGITTA_M,
     TOOL_ARC_SIDE,
@@ -77,7 +79,7 @@ DEG_TO_RAD = math.pi / 180.0
 POS_TOL_M = 1.0e-2
 DWELL_AT_INIT_POS_S = 0.25
 JOINT_ARRIVAL_THRESHOLD = 0.25
-JOINT_MAX_STEP_DEG = 0.5
+JOINT_MAX_STEP_DEG = 0.25
 JOINT_CONTROLLER_SETTLE_S = 0.25
 CARTESIAN_SETTLE_S = 0.25
 CARTESIAN_MAX_STEP_M = 0.002
@@ -1543,9 +1545,14 @@ def move_to_tool_init(
     save_path_plot: bool = True,
     path_log_dir: Path = DEFAULT_PATH_LOG_DIR,
     max_cartesian_step_m: float = CARTESIAN_MAX_STEP_M,
+    max_orientation_step_rad: float = CARTESIAN_MAX_ORI_STEP_RAD,
     tool_arc_sagitta_m: float = TOOL_ARC_SAGITTA_M,
     tool_arc_min_radius_m: float = TOOL_ARC_MIN_RADIUS_M,
     tool_arc_side: str = TOOL_ARC_SIDE,
+    tool_init_cartesian_path_json: Path = DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON,
+    use_cached_tool_init_cartesian_path: bool = True,
+    rebuild_tool_init_cartesian_path: bool = False,
+    require_cached_tool_init_cartesian_path: bool = True,
 ) -> int:
     path_trace: list[PathTraceSample] = []
     trace_start = time.perf_counter()
@@ -1567,11 +1574,17 @@ def move_to_tool_init(
         redis_client,
         dwell_at_tool_init_s=dwell_s,
         max_cartesian_step_m=max_cartesian_step_m,
+        max_orientation_step_rad=max_orientation_step_rad,
         arc_sagitta_m=tool_arc_sagitta_m,
         arc_min_radius_m=tool_arc_min_radius_m,
         arc_side=tool_arc_side,
         status_period_s=status_period_s,
         timeout_s=timeout_s,
+        path_json=tool_init_cartesian_path_json,
+        use_cached_path=use_cached_tool_init_cartesian_path,
+        rebuild_path=rebuild_tool_init_cartesian_path,
+        save_path=rebuild_tool_init_cartesian_path,
+        require_cached_path=require_cached_tool_init_cartesian_path,
     )
     if tool_init_pose is None:
         return finish(1)
@@ -1638,6 +1651,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--orientation-max-step-rad",
+        type=float,
+        default=CARTESIAN_MAX_ORI_STEP_RAD,
+        help=(
+            "Maximum orientation goal step per 10 ms tick for the Cartesian "
+            "INIT_POS -> TOOL_INIT path. Smaller values reduce wrist angular "
+            f"speed (default: {CARTESIAN_MAX_ORI_STEP_RAD})."
+        ),
+    )
+    parser.add_argument(
         "--tool-arc-sagitta-m",
         type=float,
         default=TOOL_ARC_SAGITTA_M,
@@ -1665,6 +1688,27 @@ def parse_args() -> argparse.Namespace:
             f"larger minimum distance from the robot base (default: {TOOL_ARC_SIDE})."
         ),
     )
+    parser.add_argument(
+        "--tool-init-cartesian-path-json",
+        default=str(DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON),
+        help=(
+            "JSON file used to cache the dense Cartesian INIT_POS -> TOOL_INIT "
+            f"command trajectory (default: {DEFAULT_TOOL_INIT_CARTESIAN_PATH_JSON})."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-tool-init-cartesian-path",
+        action="store_true",
+        help=(
+            "Regenerate and save the Cartesian INIT_POS -> TOOL_INIT path instead "
+            "of loading the cached JSON."
+        ),
+    )
+    parser.add_argument(
+        "--no-cached-tool-init-cartesian-path",
+        action="store_true",
+        help="Do not load a cached Cartesian INIT_POS -> TOOL_INIT path JSON.",
+    )
     return parser.parse_args()
 
 
@@ -1679,9 +1723,14 @@ def main() -> int:
             save_path_plot=not args.no_path_plot,
             path_log_dir=Path(args.path_log_dir),
             max_cartesian_step_m=args.cartesian_max_step_m,
+            max_orientation_step_rad=args.orientation_max_step_rad,
             tool_arc_sagitta_m=args.tool_arc_sagitta_m,
             tool_arc_min_radius_m=args.tool_arc_min_radius_m,
             tool_arc_side=args.tool_arc_side,
+            tool_init_cartesian_path_json=Path(args.tool_init_cartesian_path_json),
+            use_cached_tool_init_cartesian_path=not args.no_cached_tool_init_cartesian_path,
+            rebuild_tool_init_cartesian_path=args.rebuild_tool_init_cartesian_path,
+            require_cached_tool_init_cartesian_path=not args.no_cached_tool_init_cartesian_path,
         )
     except RuntimeError as exc:
         print("Could not start tool-station run:")

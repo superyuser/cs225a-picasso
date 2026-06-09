@@ -1,6 +1,6 @@
-"""Open the camera stream, translate to CAMERA_INIT, rotate the last joint,
-then hold still until a face is detected and stationary, snap a picture,
-and return to INIT_POS along the reverse motion sequence.
+"""Open the camera stream, move to INIT_POS, move in joint space to the camera
+pose, then hold still until a face is detected and stationary, snap a picture,
+and return to the INIT_POS joint configuration.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ DEFAULT_RAW_CAPTURES_DIR = DEMO_DAY_DIR / "raw-captures"
 # The face's bbox center must stay within STATIONARY_RADIUS_PX of an anchor
 # point for STATIONARY_REQUIRED_S seconds before a frame is captured.
 STATIONARY_REQUIRED_S = 2.0
-STATIONARY_RADIUS_PX = 40
+STATIONARY_RADIUS_PX = 80
 POST_CAPTURE_DISPLAY_S = 1.5
 FLASH_PERIOD_S = 0.25
 
@@ -44,18 +44,7 @@ JOINT_CONTROLLER = "joint_controller"
 DT = 0.01
 POS_TOL_M = 1.0e-2
 DWELL_AFTER_TRANSLATION_S = 0.25
-ARC_STEP_M = 0.02
-ARC_SAGITTA_M = 0.25
-# Minimum XY arc radius enforced when constructing translation paths. Short
-# chord segments would otherwise produce a small radius (sharp curvature)
-# which makes the cartesian controller shake during execution. If the radius
-# implied by ARC_SAGITTA_M falls below this floor, the sagitta is shrunk just
-# enough to lift the radius back up to ARC_MIN_RADIUS_M (i.e. the arc becomes
-# flatter / smoother). Crank this up (e.g. 2.0+) to make paths effectively
-# straight when the cartesian controller is still shaky.
-ARC_MIN_RADIUS_M = 2.0
-LAST_JOINT_TARGET_DEG = 90.0
-JOINT_ARRIVAL_THRESHOLD = 8.0e-2
+JOINT_ARRIVAL_THRESHOLD = 0.20
 JOINT_MAX_STEP_DEG = 0.5
 JOINT_CONTROLLER_SETTLE_S = 0.25
 
@@ -66,6 +55,16 @@ FACE_DETECTION_MIN_SIZE = (60, 60)
 
 CAMERA_INIT_POS_MM = np.array([-310.22, 592.11, 340.43], dtype=float)
 CAMERA_INIT_POS_M = CAMERA_INIT_POS_MM / 1000.0
+CAMERA_INIT_JOINT_CONFIG_DEG = np.array(
+    [-70.63, -32.43, -27.25, 99.52, 17.86, 38.24, 74.29],
+    dtype=float,
+)
+CAMERA_INIT_JOINT_CONFIG_RAD = CAMERA_INIT_JOINT_CONFIG_DEG * DEG_TO_RAD
+INIT_POS_JOINT_CONFIG_DEG = np.array(
+    [0.42, -27.42, -0.50, 116.48, 0.41, 53.89, -0.34],
+    dtype=float,
+)
+INIT_POS_JOINT_CONFIG_RAD = INIT_POS_JOINT_CONFIG_DEG * DEG_TO_RAD
 
 # Robot "home" pose to return to after the centered capture is taken. Sourced
 # from demo-day/config.json so all demo-day scripts share one source of truth.
@@ -83,10 +82,9 @@ INIT_POS = _load_init_pos()
 
 class CameraState(Enum):
     TRANSLATING = auto()
-    ROTATING_LAST_JOINT = auto()
+    MOVING_TO_CAMERA_JOINTS = auto()
     WAITING_FOR_FACE = auto()
-    RETURNING_LAST_JOINT = auto()
-    RETURNING_TRANSLATION = auto()
+    RETURNING_TO_INIT_JOINTS = auto()
     DONE = auto()
 
 
@@ -197,123 +195,6 @@ def position_error(current_pos: np.ndarray, goal_pos: np.ndarray) -> float:
 
 def orientation_error(current_ori: np.ndarray, goal_ori: np.ndarray) -> float:
     return float(np.linalg.norm(goal_ori - current_ori))
-
-
-def min_xy_radius(points: np.ndarray) -> float:
-    return float(np.min(np.linalg.norm(points[:, :2], axis=1)))
-
-
-def build_xy_arc_path(
-    start_pos: np.ndarray,
-    target_pos: np.ndarray,
-    *,
-    sagitta_m: float,
-    step_m: float,
-    side: str,
-    min_radius_m: float = 0.0,
-) -> tuple[np.ndarray, float]:
-    start_xy = np.array(start_pos[:2], dtype=float)
-    target_xy = np.array(target_pos[:2], dtype=float)
-    chord = target_xy - start_xy
-    chord_len = float(np.linalg.norm(chord))
-
-    if chord_len < 1.0e-6:
-        return np.array([target_pos], dtype=float), math.inf
-
-    sagitta = max(abs(sagitta_m), 1.0e-4)
-    sagitta = min(sagitta, chord_len * 0.49)
-    step_m = max(abs(step_m), 1.0e-4)
-
-    radius = chord_len**2 / (8.0 * sagitta) + sagitta / 2.0
-    half_chord = chord_len / 2.0
-
-    # Enforce a floor on the XY arc radius so short-chord paths don't produce
-    # sharp curvature (which makes the cartesian controller shake). Radius is
-    # monotonically decreasing in sagitta on (0, c/2], so to raise the radius
-    # we shrink the sagitta. Solving c^2/(8 s) + s/2 = r_min for the smaller
-    # root gives s = r_min - sqrt(r_min^2 - (c/2)^2).
-    if min_radius_m > 0.0 and radius < min_radius_m:
-        if min_radius_m >= half_chord:
-            new_sagitta = min_radius_m - math.sqrt(
-                max(min_radius_m**2 - half_chord**2, 0.0)
-            )
-            new_sagitta = max(new_sagitta, 1.0e-4)
-            sagitta = min(new_sagitta, chord_len * 0.49)
-        else:
-            # Geometrically impossible (chord is longer than the diameter
-            # implied by min_radius_m). Pick the flattest arc we can: a
-            # tiny sagitta makes the path effectively straight.
-            sagitta = max(min(sagitta, 1.0e-3), 1.0e-4)
-        radius = chord_len**2 / (8.0 * sagitta) + sagitta / 2.0
-
-    center_offset = math.sqrt(max(radius**2 - half_chord**2, 0.0))
-
-    unit_chord = chord / chord_len
-    left_normal = np.array([-unit_chord[1], unit_chord[0]], dtype=float)
-    bulge_sign = 1.0 if side == "left" else -1.0
-    bulge_normal = bulge_sign * left_normal
-
-    center = (start_xy + target_xy) / 2.0 - bulge_normal * center_offset
-
-    start_angle = math.atan2(start_xy[1] - center[1], start_xy[0] - center[0])
-    target_angle = math.atan2(target_xy[1] - center[1], target_xy[0] - center[0])
-    angle_delta = (target_angle - start_angle + math.pi) % (2.0 * math.pi) - math.pi
-
-    arc_length = abs(angle_delta) * radius
-    num_segments = max(1, int(math.ceil(arc_length / step_m)))
-
-    waypoints = []
-    for index in range(1, num_segments + 1):
-        fraction = index / num_segments
-        theta = start_angle + angle_delta * fraction
-        xy = center + radius * np.array([math.cos(theta), math.sin(theta)], dtype=float)
-        z = start_pos[2] + (target_pos[2] - start_pos[2]) * fraction
-        waypoints.append(np.array([xy[0], xy[1], z], dtype=float))
-
-    waypoints[-1] = np.array(target_pos, dtype=float)
-    return np.array(waypoints, dtype=float), radius
-
-
-def build_translation_path(
-    start_pos: np.ndarray,
-    target_pos: np.ndarray,
-    *,
-    sagitta_m: float,
-    step_m: float,
-    arc_side: str,
-    min_radius_m: float = 0.0,
-) -> tuple[np.ndarray, float, str]:
-    if arc_side in ("left", "right"):
-        path, radius = build_xy_arc_path(
-            start_pos,
-            target_pos,
-            sagitta_m=sagitta_m,
-            step_m=step_m,
-            side=arc_side,
-            min_radius_m=min_radius_m,
-        )
-        return path, radius, arc_side
-
-    left_path, left_radius = build_xy_arc_path(
-        start_pos,
-        target_pos,
-        sagitta_m=sagitta_m,
-        step_m=step_m,
-        side="left",
-        min_radius_m=min_radius_m,
-    )
-    right_path, right_radius = build_xy_arc_path(
-        start_pos,
-        target_pos,
-        sagitta_m=sagitta_m,
-        step_m=step_m,
-        side="right",
-        min_radius_m=min_radius_m,
-    )
-
-    if min_xy_radius(left_path) >= min_xy_radius(right_path):
-        return left_path, left_radius, "left"
-    return right_path, right_radius, "right"
 
 
 def make_raw_capture_name() -> str:
@@ -529,11 +410,6 @@ def move_to_camera_init(
     camera_index: int = DEFAULT_CAMERA_INDEX,
     preview: bool = True,
     config_file_name_expected: str = CONFIG_FILE_FOR_THIS_SCRIPT,
-    arc_sagitta_m: float = ARC_SAGITTA_M,
-    arc_step_m: float = ARC_STEP_M,
-    arc_side: str = "auto",
-    arc_min_radius_m: float = ARC_MIN_RADIUS_M,
-    last_joint_target_deg: float = LAST_JOINT_TARGET_DEG,
     joint_arrival_threshold: float = JOINT_ARRIVAL_THRESHOLD,
     joint_max_step_deg: float = JOINT_MAX_STEP_DEG,
     joint_controller_settle_s: float = JOINT_CONTROLLER_SETTLE_S,
@@ -566,26 +442,18 @@ def move_to_camera_init(
 
         print("Current position:", current_position)
         print("Hold orientation:", hold_orientation)
-        print("CAMERA_INIT position (m):", CAMERA_INIT_POS_M)
-        print("Last joint target (deg):", last_joint_target_deg)
+        print("INIT_POS position (m):", INIT_POS)
+        print("CAMERA_INIT Cartesian reference (m):", CAMERA_INIT_POS_M)
+        print("Camera joint target (deg):", CAMERA_INIT_JOINT_CONFIG_DEG)
+        print("Return INIT_POS joint target (deg):", INIT_POS_JOINT_CONFIG_DEG)
         print("Joint max step (deg):", joint_max_step_deg)
 
-        translation_path, arc_radius, chosen_arc_side = build_translation_path(
-            current_position,
-            CAMERA_INIT_POS_M,
-            sagitta_m=arc_sagitta_m,
-            step_m=arc_step_m,
-            arc_side=arc_side,
-            min_radius_m=arc_min_radius_m,
-        )
+        translation_path = np.array([INIT_POS], dtype=float)
         path_index = 0
         translation_target = translation_path[path_index]
 
         print("Translation waypoints:", len(translation_path))
-        print("XY arc radius (m):", arc_radius)
-        print("XY arc minimum radius enforced (m):", arc_min_radius_m)
-        print("XY arc side:", chosen_arc_side)
-        print("Minimum waypoint XY radius (m):", min_xy_radius(translation_path))
+        print("Translation phase target: INIT_POS only")
 
         set_cartesian_goal(redis_client, current_position, hold_orientation)
         set_active_controller(redis_client, CARTESIAN_CONTROLLER)
@@ -593,11 +461,10 @@ def move_to_camera_init(
 
         state = CameraState.TRANSLATING
         set_cartesian_goal(redis_client, translation_target, hold_orientation)
-        print("Phase 1: following XY arc to CAMERA_INIT while holding current orientation.")
+        print("Phase 1: translating to INIT_POS while holding current orientation.")
 
         joint_goal = None
         commanded_joint_position = None
-        pre_orientation_joint_position = None
 
         # Wait-for-stationary-face capture state.
         face_anchor_center: tuple[float, float] | None = None
@@ -660,9 +527,7 @@ def move_to_camera_init(
                             redis_keys.sensor_joint_positions,
                             (7,),
                         )
-                        pre_orientation_joint_position = current_joint_position.copy()
-                        joint_goal = current_joint_position.copy()
-                        joint_goal[-1] = last_joint_target_deg * DEG_TO_RAD
+                        joint_goal = CAMERA_INIT_JOINT_CONFIG_RAD.copy()
                         commanded_joint_position = current_joint_position.copy()
 
                         joint_names = read_optional_json(redis_client, redis_keys.joint_names)
@@ -677,9 +542,9 @@ def move_to_camera_init(
                             set_joint_goal(redis_client, current_joint_position)
                             time.sleep(DT)
 
-                        state = CameraState.ROTATING_LAST_JOINT
+                        state = CameraState.MOVING_TO_CAMERA_JOINTS
                         set_joint_goal(redis_client, commanded_joint_position)
-                        print("Phase 2: position reached. Moving only the last joint.")
+                        print("Phase 2: INIT_POS reached. Moving to camera joint configuration.")
                         print("Current joint position:", current_joint_position)
                         print("Target joint position:", joint_goal)
                         print(
@@ -690,7 +555,7 @@ def move_to_camera_init(
                         translation_target = translation_path[path_index]
                         set_cartesian_goal(redis_client, translation_target, hold_orientation)
 
-            elif state == CameraState.ROTATING_LAST_JOINT:
+            elif state == CameraState.MOVING_TO_CAMERA_JOINTS:
                 current_joint_position = read_np(
                     redis_client,
                     redis_keys.sensor_joint_positions,
@@ -703,28 +568,24 @@ def move_to_camera_init(
                 commanded_joint_position = commanded_joint_position + delta
 
                 joint_error = float(np.linalg.norm(joint_goal - current_joint_position))
-                last_joint_error = abs(float(joint_goal[-1] - current_joint_position[-1]))
                 commanded_error = float(np.linalg.norm(joint_goal - commanded_joint_position))
                 set_joint_goal(redis_client, commanded_joint_position)
                 print(
-                    "ROTATING_LAST_JOINT",
+                    "MOVING_TO_CAMERA_JOINTS",
                     "| joint_error:",
                     round(joint_error, 5),
-                    "| last_joint_error:",
-                    round(last_joint_error, 5),
                     "| commanded_remaining:",
                     round(commanded_error, 5),
                 )
 
                 if joint_error < joint_arrival_threshold:
                     state = CameraState.WAITING_FOR_FACE
-                    # Hold the current joint position; no further joint movement
-                    # until we begin the return sequence.
-                    set_joint_goal(redis_client, current_joint_position)
+                    # Hold the camera joint target until we begin the return sequence.
+                    set_joint_goal(redis_client, joint_goal)
                     face_anchor_center = None
                     stationary_since = None
                     captured_at = None
-                    print("Reached target last-joint position.")
+                    print("Reached camera joint configuration.")
                     print(
                         "Phase 3: waiting for stationary face."
                         " Hold still for"
@@ -771,25 +632,19 @@ def move_to_camera_init(
                     if now - captured_at < POST_CAPTURE_DISPLAY_S:
                         continue
 
-                    # Begin return sequence: reverse the last-joint rotation
-                    # first, then translate back to INIT_POS along a fresh arc.
+                    # Begin return sequence: move directly to the INIT_POS joint
+                    # configuration.
                     current_joint_position = read_np(
                         redis_client,
                         redis_keys.sensor_joint_positions,
                         (7,),
                     )
-                    joint_goal = pre_orientation_joint_position.copy()
+                    joint_goal = INIT_POS_JOINT_CONFIG_RAD.copy()
                     commanded_joint_position = current_joint_position.copy()
                     set_joint_goal(redis_client, commanded_joint_position)
-                    state = CameraState.RETURNING_LAST_JOINT
-                    print(
-                        "Phase 4: returning last joint to pre-orientation"
-                        " position."
-                    )
-                    print(
-                        "Pre-orientation joint position:",
-                        pre_orientation_joint_position,
-                    )
+                    state = CameraState.RETURNING_TO_INIT_JOINTS
+                    print("Phase 4: returning to INIT_POS joint configuration.")
+                    print("Return joint target:", joint_goal)
                     print(
                         "Commanded joint delta (deg):",
                         ((joint_goal - current_joint_position) / DEG_TO_RAD).round(3),
@@ -883,7 +738,7 @@ def move_to_camera_init(
                         state = CameraState.DONE
                         return True
 
-            elif state == CameraState.RETURNING_LAST_JOINT:
+            elif state == CameraState.RETURNING_TO_INIT_JOINTS:
                 current_joint_position = read_np(
                     redis_client,
                     redis_keys.sensor_joint_positions,
@@ -899,7 +754,7 @@ def move_to_camera_init(
                 commanded_error = float(np.linalg.norm(joint_goal - commanded_joint_position))
                 set_joint_goal(redis_client, commanded_joint_position)
                 print(
-                    "RETURNING_LAST_JOINT",
+                    "RETURNING_TO_INIT_JOINTS",
                     "| joint_error:",
                     round(joint_error, 5),
                     "| commanded_remaining:",
@@ -907,80 +762,10 @@ def move_to_camera_init(
                 )
 
                 if joint_error < joint_arrival_threshold:
-                    # Switch back to cartesian control and build the return arc.
-                    current_position = read_np(
-                        redis_client,
-                        redis_keys.cartesian_task_current_position,
-                        (3,),
-                    )
-                    hold_orientation = read_np(
-                        redis_client,
-                        redis_keys.cartesian_task_current_orientation,
-                        (3, 3),
-                    )
-                    set_cartesian_goal(redis_client, current_position, hold_orientation)
-                    set_active_controller(redis_client, CARTESIAN_CONTROLLER)
-                    print("Using controller:", CARTESIAN_CONTROLLER)
-                    settle_start = time.perf_counter()
-                    while time.perf_counter() - settle_start < joint_controller_settle_s:
-                        set_cartesian_goal(redis_client, current_position, hold_orientation)
-                        time.sleep(DT)
-
-                    translation_path, return_arc_radius, return_arc_side = build_translation_path(
-                        current_position,
-                        INIT_POS,
-                        sagitta_m=arc_sagitta_m,
-                        step_m=arc_step_m,
-                        arc_side=arc_side,
-                        min_radius_m=arc_min_radius_m,
-                    )
-                    path_index = 0
-                    translation_target = translation_path[path_index]
-                    set_cartesian_goal(redis_client, translation_target, hold_orientation)
-                    state = CameraState.RETURNING_TRANSLATION
-                    print("Phase 5: returning along XY arc to INIT_POS.")
-                    print("Return waypoints:", len(translation_path))
-                    print("Return arc radius (m):", return_arc_radius)
-                    print("Return arc minimum radius enforced (m):", arc_min_radius_m)
-                    print("Return arc side:", return_arc_side)
-                    print("INIT_POS target:", INIT_POS)
-
-            elif state == CameraState.RETURNING_TRANSLATION:
-                current_position = read_np(
-                    redis_client,
-                    redis_keys.cartesian_task_current_position,
-                    (3,),
-                )
-                current_orientation = read_np(
-                    redis_client,
-                    redis_keys.cartesian_task_current_orientation,
-                    (3, 3),
-                )
-                translation_target = translation_path[path_index]
-                pos_err = position_error(current_position, translation_target)
-                hold_ori_err = orientation_error(current_orientation, hold_orientation)
-                set_cartesian_goal(redis_client, translation_target, hold_orientation)
-                print(
-                    "RETURNING_TRANSLATION",
-                    path_index + 1,
-                    "/",
-                    len(translation_path),
-                    "| pos_error:",
-                    round(pos_err, 5),
-                    "| hold_ori_error:",
-                    round(hold_ori_err, 5),
-                )
-
-                if pos_err < POS_TOL_M:
-                    path_index += 1
-                    if path_index >= len(translation_path):
-                        time.sleep(DWELL_AFTER_TRANSLATION_S)
-                        print(f"Reached INIT_POS. Return sequence complete.")
-                        state = CameraState.DONE
-                        return True
-                    else:
-                        translation_target = translation_path[path_index]
-                        set_cartesian_goal(redis_client, translation_target, hold_orientation)
+                    set_joint_goal(redis_client, joint_goal)
+                    print("Reached INIT_POS joint configuration. Return sequence complete.")
+                    state = CameraState.DONE
+                    return True
 
             elif state == CameraState.DONE:
                 return True
@@ -1006,8 +791,8 @@ def move_to_camera_init(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Open the camera stream, move the robot to CAMERA_INIT, rotate the last joint, "
-            "then track the closest detected face."
+            "Open the camera stream, translate to INIT_POS, move to the camera "
+            "joint configuration, then track the closest detected face."
         )
     )
     parser.add_argument(
@@ -1030,41 +815,6 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default=CONFIG_FILE_FOR_THIS_SCRIPT,
         help=f"Expected Sai config file (default: {CONFIG_FILE_FOR_THIS_SCRIPT}).",
-    )
-    parser.add_argument(
-        "--arc-sagitta-m",
-        type=float,
-        default=ARC_SAGITTA_M,
-        help=f"XY arc sagitta in meters (default: {ARC_SAGITTA_M}).",
-    )
-    parser.add_argument(
-        "--arc-step-m",
-        type=float,
-        default=ARC_STEP_M,
-        help=f"Approximate translation waypoint spacing in meters (default: {ARC_STEP_M}).",
-    )
-    parser.add_argument(
-        "--arc-side",
-        choices=("auto", "left", "right"),
-        default="auto",
-        help="XY arc side from current position to target (default: auto).",
-    )
-    parser.add_argument(
-        "--arc-min-radius-m",
-        type=float,
-        default=ARC_MIN_RADIUS_M,
-        help=(
-            "Minimum XY arc radius in meters. If the radius implied by "
-            "--arc-sagitta-m falls below this floor (e.g. on short chords), "
-            "the sagitta is shrunk so the arc is flatter and the cartesian "
-            f"controller is less likely to shake (default: {ARC_MIN_RADIUS_M})."
-        ),
-    )
-    parser.add_argument(
-        "--last-joint-target-deg",
-        type=float,
-        default=LAST_JOINT_TARGET_DEG,
-        help=f"Absolute target angle for the last joint in degrees (default: {LAST_JOINT_TARGET_DEG}).",
     )
     parser.add_argument(
         "--joint-arrival-threshold",
@@ -1118,11 +868,6 @@ def main() -> None:
         camera_index=args.camera_index,
         preview=not args.no_preview,
         config_file_name_expected=args.config_file,
-        arc_sagitta_m=args.arc_sagitta_m,
-        arc_step_m=args.arc_step_m,
-        arc_side=args.arc_side,
-        arc_min_radius_m=args.arc_min_radius_m,
-        last_joint_target_deg=args.last_joint_target_deg,
         joint_arrival_threshold=args.joint_arrival_threshold,
         joint_max_step_deg=args.joint_max_step_deg,
         joint_controller_settle_s=args.joint_controller_settle_s,

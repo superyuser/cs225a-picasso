@@ -1,0 +1,416 @@
+[
+  {
+    "label": 1,
+    "area_px": 198461,
+    "centroid_frac": [
+      0.8456,
+      0.3909
+    ],
+    "bbox_px": [
+      57,
+      0,
+      967,
+      1024
+    ],
+    "overlap": {
+      "hair": 0.2658,
+      "shirt": 0.0942,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.2241,
+      "support": 1.0
+    },
+    "touches_border": true
+  },
+  {
+    "label": 2,
+    "area_px": 216762,
+    "centroid_frac": [
+      0.5109,
+      0.4089
+    ],
+    "bbox_px": [
+      149,
+      24,
+      726,
+      928
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.1628,
+      "face": 0.0219,
+      "neck": 0.0,
+      "accessory": 0.2807,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 3,
+    "area_px": 12743,
+    "centroid_frac": [
+      0.5253,
+      0.3025
+    ],
+    "bbox_px": [
+      402,
+      188,
+      259,
+      189
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.8565,
+      "neck": 0.0,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 4,
+    "area_px": 555,
+    "centroid_frac": [
+      0.3875,
+      0.3046
+    ],
+    "bbox_px": [
+      374,
+      301,
+      47,
+      26
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 5,
+    "area_px": 14320,
+    "centroid_frac": [
+      0.6267,
+      0.4101
+    ],
+    "bbox_px": [
+      555,
+      342,
+      168,
+      155
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 0.1918,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 6,
+    "area_px": 13933,
+    "centroid_frac": [
+      0.3739,
+      0.4113
+    ],
+    "bbox_px": [
+      304,
+      344,
+      166,
+      153
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 0.1975,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 7,
+    "area_px": 72281,
+    "centroid_frac": [
+      0.5027,
+      0.5494
+    ],
+    "bbox_px": [
+      285,
+      385,
+      461,
+      314
+    ],
+    "overlap": {
+      "hair": 0.6426,
+      "shirt": 0.0,
+      "face": 0.9988,
+      "neck": 0.2085,
+      "accessory": 0.0255,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 8,
+    "area_px": 4448,
+    "centroid_frac": [
+      0.7521,
+      0.4467
+    ],
+    "bbox_px": [
+      738,
+      387,
+      59,
+      144
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.0852,
+      "neck": 0.0,
+      "accessory": 0.9415,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 9,
+    "area_px": 4273,
+    "centroid_frac": [
+      0.2529,
+      0.4467
+    ],
+    "bbox_px": [
+      234,
+      388,
+      58,
+      143
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.1549,
+      "neck": 0.0,
+      "accessory": 0.909,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 10,
+    "area_px": 239,
+    "centroid_frac": [
+      0.6222,
+      0.3901
+    ],
+    "bbox_px": [
+      629,
+      391,
+      17,
+      18
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 1.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 11,
+    "area_px": 239,
+    "centroid_frac": [
+      0.4022,
+      0.3911
+    ],
+    "bbox_px": [
+      403,
+      392,
+      18,
+      18
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 1.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 13,
+    "area_px": 7370,
+    "centroid_frac": [
+      0.6601,
+      0.6737
+    ],
+    "bbox_px": [
+      634,
+      595,
+      83,
+      164
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0077,
+      "face": 0.0912,
+      "neck": 0.0969,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 14,
+    "area_px": 8534,
+    "centroid_frac": [
+      0.3426,
+      0.6768
+    ],
+    "bbox_px": [
+      312,
+      598,
+      88,
+      170
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0245,
+      "face": 0.1128,
+      "neck": 0.1574,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 15,
+    "area_px": 33113,
+    "centroid_frac": [
+      0.5035,
+      0.7549
+    ],
+    "bbox_px": [
+      375,
+      682,
+      283,
+      173
+    ],
+    "overlap": {
+      "hair": 0.2756,
+      "shirt": 0.6909,
+      "face": 0.0674,
+      "neck": 0.7817,
+      "accessory": 0.0811,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 16,
+    "area_px": 608,
+    "centroid_frac": [
+      0.1789,
+      0.7747
+    ],
+    "bbox_px": [
+      178,
+      744,
+      16,
+      80
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.9803,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 17,
+    "area_px": 276,
+    "centroid_frac": [
+      0.8205,
+      0.7733
+    ],
+    "bbox_px": [
+      834,
+      756,
+      10,
+      57
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 1.0,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 18,
+    "area_px": 14602,
+    "centroid_frac": [
+      0.4987,
+      0.8294
+    ],
+    "bbox_px": [
+      329,
+      764,
+      367,
+      139
+    ],
+    "overlap": {
+      "hair": 0.5899,
+      "shirt": 1.0,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.3025,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 19,
+    "area_px": 100122,
+    "centroid_frac": [
+      0.5054,
+      0.9322
+    ],
+    "bbox_px": [
+      83,
+      818,
+      871,
+      206
+    ],
+    "overlap": {
+      "hair": 0.5561,
+      "shirt": 1.0,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.0402,
+      "support": 1.0
+    },
+    "touches_border": true
+  }
+]
