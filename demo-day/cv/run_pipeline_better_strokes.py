@@ -40,6 +40,21 @@ MIN_FILL_CONTOUR_AREA = 40
 MIN_FILL_CONTOUR_LENGTH = 20
 FILL_SIMPLIFY_EPS_FRAC = 0.004
 
+# Human-like hatch shading strokes
+HATCH_STEP_FACTOR = 0.62          # lower = denser overlap; 0.55-0.70 is good
+HATCH_MIN_SEGMENT_LEN_MM = 18.0   # discard tiny broken hatch fragments
+HATCH_POINT_SPACING_PX = 18       # larger = fewer robot waypoints per stroke
+HATCH_SMOOTH_ITERATIONS = 1
+HATCH_ANGLE_JITTER_DEG = 3.0
+HAIR_HATCH_ANGLE_DEG = -8.0       # slight natural diagonal
+SHIRT_HATCH_ANGLE_DEG = 12.0
+
+# Cleaner outline centerline tracing instead of tracing both edges of thick black pixels
+OUTLINE_SKELETONIZE = True
+MIN_OUTLINE_PATH_LEN_MM = 3.0
+OUTLINE_POINT_SPACING_PX = 10
+OUTLINE_OPEN_SIMPLIFY_EPS_FRAC = 0.003
+
 # ------------------------------------------------------------
 # Corner filleting / smoothing
 #
@@ -299,6 +314,312 @@ def fillet_polyline(
 
     return pts
 
+
+
+# ============================================================
+# CENTERLINE / HATCH HELPERS
+# ============================================================
+
+def skeletonize_mask(mask):
+    """Skeletonize the black line mask into 1-pixel centerlines.
+
+    Uses skimage when available because it gives much cleaner centerlines on
+    thick antialiased cartoon strokes. Falls back to a pure OpenCV morphology
+    skeleton if skimage is not installed.
+    """
+    try:
+        from skimage.morphology import skeletonize
+        skel = skeletonize(mask.astype(bool))
+        skel = keep_components_larger_than(skel, 3)
+        return skel
+    except Exception:
+        img = mask_u8(mask)
+        skel = np.zeros_like(img)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+        while True:
+            opened = cv2.morphologyEx(img, cv2.MORPH_OPEN, element)
+            temp = cv2.subtract(img, opened)
+            skel = cv2.bitwise_or(skel, temp)
+            img = cv2.erode(img, element)
+            if cv2.countNonZero(img) == 0:
+                break
+
+        skel = skel > 0
+        skel = keep_components_larger_than(skel, 3)
+        return skel
+
+
+def chaikin_open_polyline(points, iterations=1, ratio=0.25):
+    """Smooth an open robot path while preserving endpoints."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 3 or iterations <= 0:
+        return pts
+    for _ in range(iterations):
+        out = [pts[0]]
+        for i in range(len(pts) - 1):
+            p = pts[i]
+            q = pts[i + 1]
+            out.append((1.0 - ratio) * p + ratio * q)
+            out.append(ratio * p + (1.0 - ratio) * q)
+        out.append(pts[-1])
+        pts = np.asarray(out, dtype=np.float64)
+    return pts
+
+
+def resample_polyline_px(points, spacing_px):
+    """Downsample a polyline by accumulated arc length."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) <= 2 or spacing_px <= 1:
+        return pts
+
+    out = [pts[0]]
+    acc = 0.0
+    prev = pts[0]
+    for p in pts[1:]:
+        seg = float(np.linalg.norm(p - prev))
+        acc += seg
+        if acc >= spacing_px:
+            out.append(p)
+            acc = 0.0
+        prev = p
+    if np.linalg.norm(out[-1] - pts[-1]) > 1e-6:
+        out.append(pts[-1])
+    return np.asarray(out, dtype=np.float64)
+
+
+def polyline_length_px(points):
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
+
+def trace_skeleton_paths(skel):
+    """Trace a 1-pixel skeleton into open polylines.
+
+    This is intentionally graph-based: endpoints/junctions become path breaks,
+    which avoids the old behavior where the robot traced the outer boundary of
+    a thick black stroke and produced doubled, messy outlines.
+    """
+    h, w = skel.shape
+    ys, xs = np.nonzero(skel)
+    pixels = set(zip(xs.tolist(), ys.tolist()))
+    if not pixels:
+        return []
+
+    nbrs = {}
+    for x, y in pixels:
+        ns = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                q = (x + dx, y + dy)
+                if q in pixels:
+                    ns.append(q)
+        nbrs[(x, y)] = ns
+
+    degree = {p: len(nbrs[p]) for p in pixels}
+    nodes = {p for p, d in degree.items() if d != 2}
+    visited_edges = set()
+    paths = []
+
+    def edge_key(a, b):
+        return tuple(sorted((a, b)))
+
+    def walk(start, nxt):
+        path = [start, nxt]
+        visited_edges.add(edge_key(start, nxt))
+        prev, curr = start, nxt
+        while curr not in nodes:
+            candidates = [q for q in nbrs[curr] if q != prev]
+            if not candidates:
+                break
+            q = candidates[0]
+            ek = edge_key(curr, q)
+            if ek in visited_edges:
+                break
+            visited_edges.add(ek)
+            path.append(q)
+            prev, curr = curr, q
+        return path
+
+    # Paths that start/end at endpoints or junctions.
+    for start in list(nodes):
+        for nxt in nbrs[start]:
+            if edge_key(start, nxt) not in visited_edges:
+                paths.append(walk(start, nxt))
+
+    # Closed loops with no degree != 2 nodes.
+    for p in list(pixels):
+        for q in nbrs[p]:
+            if edge_key(p, q) in visited_edges:
+                continue
+            loop = [p, q]
+            visited_edges.add(edge_key(p, q))
+            prev, curr = p, q
+            while True:
+                candidates = [r for r in nbrs[curr] if r != prev]
+                if not candidates:
+                    break
+                r = candidates[0]
+                if r == p:
+                    break
+                ek = edge_key(curr, r)
+                if ek in visited_edges:
+                    break
+                visited_edges.add(ek)
+                loop.append(r)
+                prev, curr = curr, r
+            paths.append(loop)
+
+    return [np.asarray(path, dtype=np.float64) for path in paths if len(path) >= 3]
+
+
+def skeleton_to_outline_strokes(line_mask, canvas_w_mm, canvas_h_mm):
+    h, w = line_mask.shape
+    skel = skeletonize_mask(line_mask)
+    paths = trace_skeleton_paths(skel)
+
+    strokes = []
+    min_len_px = (MIN_OUTLINE_PATH_LEN_MM / canvas_w_mm) * w
+
+    for path in paths:
+        if polyline_length_px(path) < min_len_px:
+            continue
+
+        path = resample_polyline_px(path, OUTLINE_POINT_SPACING_PX)
+        eps = OUTLINE_OPEN_SIMPLIFY_EPS_FRAC * max(polyline_length_px(path), 1.0)
+        approx = cv2.approxPolyDP(path.reshape(-1, 1, 2).astype(np.float32), eps, False)[:, 0, :]
+        smooth = chaikin_open_polyline(approx, iterations=1, ratio=0.22)
+        smooth = resample_polyline_px(smooth, OUTLINE_POINT_SPACING_PX)
+        pts_px_int = smooth.round().astype(int)
+
+        pts_mm = [
+            px_to_mm(int(x), int(y), w, h, canvas_w_mm, canvas_h_mm)
+            for x, y in pts_px_int
+        ]
+
+        strokes.append({
+            "type": "centerline_outline",
+            "layer": "outline_black",
+            "closed": False,
+            "brush_width_mm": OUTLINE_BRUSH_WIDTH_MM,
+            "points_px": pts_px_int.tolist(),
+            "points_mm": pts_mm,
+        })
+
+    # Long strokes first gives the robot a cleaner visual base.
+    strokes.sort(key=lambda st: -len(st["points_px"]))
+    return strokes
+
+
+def generate_hatch_fill_strokes(
+    mask,
+    region_name,
+    canvas_w_mm,
+    canvas_h_mm,
+    brush_width_mm,
+    angle_deg,
+):
+    """Generate human-like repeated shading strokes clipped to a mask.
+
+    Instead of onion-peel closed contours, this sweeps long parallel hatch lines
+    through the fill area, clips each line to the safe eroded region, and emits
+    open polylines. This looks much more like a person shading an area with a
+    brush/marker: repeated long strokes, mostly parallel, with small natural
+    variations and alternating travel direction.
+    """
+    h, w = mask.shape
+    brush_px = mm_to_px(brush_width_mm, w, canvas_w_mm)
+    safe_margin_px = max(1, brush_px // 2)
+    step_px = max(2, int(round(HATCH_STEP_FACTOR * brush_px)))
+
+    safe = morph_erode(mask, 2 * safe_margin_px + 1)
+    if np.sum(safe) == 0:
+        safe = mask.copy()
+
+    ys, xs = np.nonzero(safe)
+    if len(xs) == 0:
+        return []
+
+    theta = math.radians(angle_deg + random.uniform(-HATCH_ANGLE_JITTER_DEG, HATCH_ANGLE_JITTER_DEG))
+    d = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)      # along-stroke
+    n = np.array([-math.sin(theta), math.cos(theta)], dtype=np.float64)     # across-stroke
+
+    coords = np.column_stack([xs, ys]).astype(np.float64)
+    across = coords @ n
+    min_a = float(np.min(across)) - step_px
+    max_a = float(np.max(across)) + step_px
+
+    diag = int(math.ceil(math.hypot(w, h))) + 20
+    offsets = np.arange(min_a, max_a + 1e-6, step_px)
+    random.shuffle(offsets)
+
+    strokes = []
+    min_seg_len_px = (HATCH_MIN_SEGMENT_LEN_MM / canvas_w_mm) * w
+    center = np.array([w / 2.0, h / 2.0], dtype=np.float64)
+
+    for stroke_idx, off in enumerate(offsets):
+        # Point on this infinite line: center shifted so dot(p, n) == off.
+        p0 = center + (off - float(center @ n)) * n
+        p1 = p0 - diag * d
+        p2 = p0 + diag * d
+
+        line_img = np.zeros((h, w), dtype=np.uint8)
+        cv2.line(
+            line_img,
+            tuple(np.round(p1).astype(int)),
+            tuple(np.round(p2).astype(int)),
+            255,
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+
+        clipped = (line_img > 0) & safe
+        clipped = keep_components_larger_than(clipped, 3)
+        contours, _ = cv2.findContours(mask_u8(clipped), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        segs = []
+        for contour in contours:
+            pts = contour[:, 0, :].astype(np.float64)
+            if len(pts) < 2:
+                continue
+            order = np.argsort(pts @ d)
+            pts = pts[order]
+            if polyline_length_px(pts) < min_seg_len_px:
+                continue
+
+            pts = resample_polyline_px(pts, HATCH_POINT_SPACING_PX)
+            pts = chaikin_open_polyline(pts, iterations=HATCH_SMOOTH_ITERATIONS, ratio=0.18)
+            pts = resample_polyline_px(pts, HATCH_POINT_SPACING_PX)
+            segs.append(pts)
+
+        # Draw nearby segments in a stable order along the stroke axis.
+        segs.sort(key=lambda arr: float(np.mean(arr @ d)))
+        for pts in segs:
+            # Alternate direction to reduce unnecessary robot travel.
+            if (len(strokes) % 2) == 1:
+                pts = pts[::-1]
+            pts_px_int = pts.round().astype(int)
+            pts_mm = [
+                px_to_mm(int(x), int(y), w, h, canvas_w_mm, canvas_h_mm)
+                for x, y in pts_px_int
+            ]
+            strokes.append({
+                "type": "hatch_fill",
+                "layer": region_name,
+                "closed": False,
+                "brush_width_mm": brush_width_mm,
+                "points_px": pts_px_int.tolist(),
+                "points_mm": pts_mm,
+            })
+
+    # Optional: keep physical execution mostly top-to-bottom/left-to-right instead
+    # of fully random, because robot travel becomes saner and the visual still reads human.
+    strokes.sort(key=lambda st: (np.mean([p[1] for p in st["points_px"]]), np.mean([p[0] for p in st["points_px"]])))
+    return strokes
 
 # ============================================================
 # LINE ART EXTRACTION
@@ -669,28 +990,27 @@ def render_stroke_preview(
     h, w = image_shape
     vis = np.ones((h, w, 3), dtype=np.uint8) * 255
 
-    outline_px = mm_to_px(OUTLINE_BRUSH_WIDTH_MM, w, canvas_w_mm)
-    fill_px = mm_to_px(FILL_BRUSH_WIDTH_MM, w, canvas_w_mm)
-
     def draw_fill_stroke(stroke, color):
         pts = np.array(stroke["points_px"], dtype=np.int32).reshape(-1, 1, 2)
+        thickness = mm_to_px(float(stroke.get("brush_width_mm", FILL_BRUSH_WIDTH_MM)), w, canvas_w_mm)
         cv2.polylines(
             vis,
             [pts],
             isClosed=stroke.get("closed", True),
             color=color,
-            thickness=fill_px,
+            thickness=thickness,
             lineType=cv2.LINE_AA,
         )
 
     def draw_outline_stroke(stroke):
         pts = np.array(stroke["points_px"], dtype=np.int32).reshape(-1, 1, 2)
+        thickness = mm_to_px(float(stroke.get("brush_width_mm", OUTLINE_BRUSH_WIDTH_MM)), w, canvas_w_mm)
         cv2.polylines(
             vis,
             [pts],
             isClosed=stroke.get("closed", True),
             color=(0, 0, 0),
-            thickness=outline_px,
+            thickness=thickness,
             lineType=cv2.LINE_AA,
         )
 
@@ -712,6 +1032,78 @@ def render_stroke_preview(
             draw_outline_stroke(stroke)
 
     cv2.imwrite(out_path, vis)
+
+
+def render_paint_stroke_animation(
+    image_shape,
+    outline_strokes,
+    hair_strokes,
+    shirt_strokes,
+    canvas_w_mm,
+    out_path,
+    fps=24,
+    strokes_per_frame=1,
+    hold_seconds=1.0,
+):
+    """
+    Write an MP4 showing strokes painted in physical order:
+    shirt color -> hair color -> outline.
+    """
+    h, w = image_shape
+    fps = max(1, int(fps))
+    strokes_per_frame = max(1, int(strokes_per_frame))
+    hold_frames = max(0, int(round(float(hold_seconds) * fps)))
+
+    ensure_dir(str(Path(out_path).parent))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {out_path}")
+
+    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
+
+    def draw_stroke(stroke, color, default_width_mm):
+        pts = np.array(stroke["points_px"], dtype=np.int32).reshape(-1, 1, 2)
+        thickness = mm_to_px(
+            float(stroke.get("brush_width_mm", default_width_mm)),
+            w,
+            canvas_w_mm,
+        )
+        cv2.polylines(
+            canvas,
+            [pts],
+            isClosed=stroke.get("closed", True),
+            color=color,
+            thickness=thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+    ordered_layers = [
+        (shirt_strokes, (170, 210, 235), FILL_BRUSH_WIDTH_MM),
+        (hair_strokes, (80, 120, 180), FILL_BRUSH_WIDTH_MM),
+        (outline_strokes, (0, 0, 0), OUTLINE_BRUSH_WIDTH_MM),
+    ]
+
+    for _ in range(max(1, hold_frames // 2)):
+        writer.write(canvas)
+
+    strokes_since_frame = 0
+    for strokes, color, default_width_mm in ordered_layers:
+        for stroke in strokes:
+            draw_stroke(stroke, color, default_width_mm)
+            strokes_since_frame += 1
+            if strokes_since_frame >= strokes_per_frame:
+                writer.write(canvas)
+                strokes_since_frame = 0
+
+        if strokes_since_frame:
+            writer.write(canvas)
+            strokes_since_frame = 0
+
+        for _ in range(hold_frames):
+            writer.write(canvas)
+
+    writer.release()
 
 
 # ============================================================
@@ -741,6 +1133,38 @@ def main():
             f"The file is written as <stroke-jsons-dir>/<input_stem>.json. "
             f"Default: {DEFAULT_STROKE_JSONS_DIR}."
         ),
+    )
+    parser.add_argument(
+        "--animation-output",
+        default=None,
+        type=str,
+        help=(
+            "Path for the MP4 stroke animation. Defaults to "
+            "<strokes-dir>/<input_stem>/08_paint_stroke_animation.mp4."
+        ),
+    )
+    parser.add_argument(
+        "--animation-fps",
+        default=24,
+        type=int,
+        help="Frames per second for the MP4 stroke animation. Default: 24.",
+    )
+    parser.add_argument(
+        "--animation-strokes-per-frame",
+        default=1,
+        type=int,
+        help="Number of generated strokes to add per animation frame. Default: 1.",
+    )
+    parser.add_argument(
+        "--animation-hold-seconds",
+        default=1.0,
+        type=float,
+        help="Seconds to pause at the start and after each paint layer. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--no-animation",
+        action="store_true",
+        help="Skip writing the MP4 stroke animation.",
     )
     parser.add_argument("--canvas_w_mm", default=CANVAS_WIDTH_MM, type=float)
     parser.add_argument("--canvas_h_mm", default=CANVAS_HEIGHT_MM, type=float)
@@ -822,26 +1246,35 @@ def main():
     # --------------------------------------------------------
     # 3. Generate strokes
     # --------------------------------------------------------
-    outline_strokes = contours_to_outline_strokes(
-        line_mask,
-        canvas_w_mm=args.canvas_w_mm,
-        canvas_h_mm=args.canvas_h_mm,
-    )
+    if OUTLINE_SKELETONIZE:
+        outline_strokes = skeleton_to_outline_strokes(
+            line_mask,
+            canvas_w_mm=args.canvas_w_mm,
+            canvas_h_mm=args.canvas_h_mm,
+        )
+    else:
+        outline_strokes = contours_to_outline_strokes(
+            line_mask,
+            canvas_w_mm=args.canvas_w_mm,
+            canvas_h_mm=args.canvas_h_mm,
+        )
 
-    hair_strokes = generate_onion_fill_strokes(
+    hair_strokes = generate_hatch_fill_strokes(
         hair_mask,
         region_name="hair_color_2",
         canvas_w_mm=args.canvas_w_mm,
         canvas_h_mm=args.canvas_h_mm,
         brush_width_mm=FILL_BRUSH_WIDTH_MM,
+        angle_deg=HAIR_HATCH_ANGLE_DEG,
     )
 
-    shirt_strokes = generate_onion_fill_strokes(
+    shirt_strokes = generate_hatch_fill_strokes(
         shirt_mask,
         region_name="shirt_color_3",
         canvas_w_mm=args.canvas_w_mm,
         canvas_h_mm=args.canvas_h_mm,
         brush_width_mm=FILL_BRUSH_WIDTH_MM,
+        angle_deg=SHIRT_HATCH_ANGLE_DEG,
     )
 
     # --------------------------------------------------------
@@ -883,6 +1316,25 @@ def main():
         black_on_top=True,
     )
 
+    animation_path = None
+    if not args.no_animation:
+        animation_path = (
+            Path(args.animation_output)
+            if args.animation_output is not None
+            else strokes_dir / "08_paint_stroke_animation.mp4"
+        )
+        render_paint_stroke_animation(
+            (h, w),
+            outline_strokes,
+            hair_strokes,
+            shirt_strokes,
+            args.canvas_w_mm,
+            str(animation_path),
+            fps=args.animation_fps,
+            strokes_per_frame=args.animation_strokes_per_frame,
+            hold_seconds=args.animation_hold_seconds,
+        )
+
     # --------------------------------------------------------
     # 5. Save painting plan JSON
     # --------------------------------------------------------
@@ -891,20 +1343,23 @@ def main():
         "canvas_width_mm": args.canvas_w_mm,
         "canvas_height_mm": args.canvas_h_mm,
         "execution_order_requested": [
-            "outline_black",
-            "hair_color_2",
-            "shirt_color_3"
-        ],
-        "recommended_physical_order": [
-            "hair_color_2",
             "shirt_color_3",
+            "hair_color_2",
             "outline_black"
         ],
+        "recommended_physical_order": [
+            "shirt_color_3",
+            "hair_color_2",
+            "outline_black"
+        ],
+        "animation_output": str(animation_path) if animation_path is not None else None,
         "notes": [
             "Face and accessories/headphones are intentionally left uncolored.",
             "Hair and shirt masks use the earlier prior+seed-grow logic that behaved better.",
-            "Fill stroke generation is improved using inward contour peeling ('onion-peel') for smoother, more complete coverage.",
-            "Contour fill strokes are spaced based on brush size, giving a flatter brush-like reconstruction instead of scribbly random chunks."
+            "Outline generation uses skeleton centerline tracing, so the robot follows the center of the black line instead of both jagged boundaries.",
+            "Fill stroke generation uses clipped hatch strokes: long, smooth, repeated open strokes similar to human shading.",
+            "Fill brush width is reduced to 5.5 mm for better continuity and less chunky coverage.",
+            "The MP4 animation paints generated strokes in this order: shirt color, hair color, outline."
         ],
         "layers": [
             {
@@ -938,11 +1393,15 @@ def main():
     print(f"Outline strokes: {len(outline_strokes)}")
     print(f"Hair strokes:    {len(hair_strokes)}")
     print(f"Shirt strokes:   {len(shirt_strokes)}")
+    if animation_path is not None:
+        print(f"Animation:       {animation_path}")
     print()
     print("Inspect these first:")
     print(f"  {strokes_dir / '05_region_preview.png'}")
     print(f"  {strokes_dir / '06_stroke_preview_requested_order.png'}")
     print(f"  {strokes_dir / '07_stroke_preview_clean_visual.png'}")
+    if animation_path is not None:
+        print(f"  {animation_path}")
     print(f"  {json_path}")
 
 
