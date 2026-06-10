@@ -1,0 +1,255 @@
+[
+  {
+    "label": 1,
+    "area_px": 43352,
+    "centroid_frac": [
+      0.4949,
+      0.487
+    ],
+    "bbox_px": [
+      120,
+      41,
+      783,
+      983
+    ],
+    "overlap": {
+      "hair": 0.9022,
+      "shirt": 0.2227,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.3774,
+      "support": 1.0
+    },
+    "touches_border": true
+  },
+  {
+    "label": 2,
+    "area_px": 57381,
+    "centroid_frac": [
+      0.5101,
+      0.1806
+    ],
+    "bbox_px": [
+      278,
+      73,
+      467,
+      305
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.0,
+      "neck": 0.0,
+      "accessory": 0.0271,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 3,
+    "area_px": 91339,
+    "centroid_frac": [
+      0.4861,
+      0.3887
+    ],
+    "bbox_px": [
+      320,
+      173,
+      366,
+      416
+    ],
+    "overlap": {
+      "hair": 0.8843,
+      "shirt": 0.0,
+      "face": 0.884,
+      "neck": 0.0,
+      "accessory": 0.1134,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 4,
+    "area_px": 2398,
+    "centroid_frac": [
+      0.2925,
+      0.3946
+    ],
+    "bbox_px": [
+      280,
+      353,
+      45,
+      103
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.7198,
+      "neck": 0.0,
+      "accessory": 0.3053,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 5,
+    "area_px": 2832,
+    "centroid_frac": [
+      0.6909,
+      0.3976
+    ],
+    "bbox_px": [
+      680,
+      354,
+      51,
+      104
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.9506,
+      "neck": 0.0,
+      "accessory": 0.3164,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 6,
+    "area_px": 23304,
+    "centroid_frac": [
+      0.6938,
+      0.5412
+    ],
+    "bbox_px": [
+      628,
+      380,
+      156,
+      298
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.6936,
+      "neck": 0.0018,
+      "accessory": 0.1369,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 7,
+    "area_px": 20497,
+    "centroid_frac": [
+      0.2856,
+      0.5322
+    ],
+    "bbox_px": [
+      222,
+      402,
+      146,
+      260
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 0.5335,
+      "neck": 0.0,
+      "accessory": 0.2891,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 8,
+    "area_px": 2572,
+    "centroid_frac": [
+      0.3745,
+      0.5733
+    ],
+    "bbox_px": [
+      364,
+      540,
+      53,
+      97
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 9,
+    "area_px": 1702,
+    "centroid_frac": [
+      0.6034,
+      0.5697
+    ],
+    "bbox_px": [
+      593,
+      542,
+      43,
+      91
+    ],
+    "overlap": {
+      "hair": 1.0,
+      "shirt": 0.0,
+      "face": 1.0,
+      "neck": 0.0,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 10,
+    "area_px": 21332,
+    "centroid_frac": [
+      0.4899,
+      0.6495
+    ],
+    "bbox_px": [
+      416,
+      582,
+      173,
+      197
+    ],
+    "overlap": {
+      "hair": 0.0753,
+      "shirt": 0.0322,
+      "face": 0.8752,
+      "neck": 0.8714,
+      "accessory": 0.0,
+      "support": 1.0
+    },
+    "touches_border": false
+  },
+  {
+    "label": 11,
+    "area_px": 193866,
+    "centroid_frac": [
+      0.4995,
+      0.8509
+    ],
+    "bbox_px": [
+      150,
+      607,
+      723,
+      417
+    ],
+    "overlap": {
+      "hair": 0.7354,
+      "shirt": 0.8735,
+      "face": 0.0167,
+      "neck": 0.1043,
+      "accessory": 0.1493,
+      "support": 1.0
+    },
+    "touches_border": true
+  }
+]

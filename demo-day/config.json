@@ -1,7 +1,7 @@
 {
   "units": "meters",
   "init_pos_m": [0.55, 0.11226, 0.3151],
-  "canvas_corner_x_offset_m": -0.003,
+  "canvas_corner_x_offset_m": -0.000,
   "actual_canvas_size_m": 0.254,
   "canvas_border_horizontal_offset_m": -0.025,
   "canvas_border_vertical_offset_m": 0.0,
@@ -42,9 +42,9 @@
 
   "WATER_TO_NAPKIN_INIT_POS": [-79.60, -523.02, 370.91],
   "NAPKIN_LIFT1_POS": [-277.76, -515.62, 370.91],
-  "NAPKIN_S1_POS": [-277.76, -515.62, 285.80],
+  "NAPKIN_S1_POS": [-277.76, -515.62, 282.80],
   "NAPKIN_LIFT2_POS": [-277.76, -573.07, 370.91],
-  "NAPKIN_S2_POS": [-277.76, -573.07, 285.80],
+  "NAPKIN_S2_POS": [-277.76, -573.07, 282.80],
 
   "CANVAS_PADDING": 0.024
 

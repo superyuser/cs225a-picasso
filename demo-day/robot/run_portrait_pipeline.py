@@ -435,7 +435,7 @@ def parse_args() -> argparse.Namespace:
     capture.add_argument("--camera-index", type=int, default=0)
     capture.add_argument("--no-preview", action="store_true")
     capture.add_argument("--config-file", default="basket.xml")
-    capture.add_argument("--joint-arrival-threshold", type=float, default=0.22)
+    capture.add_argument("--joint-arrival-threshold", type=float, default=0.28)
     capture.add_argument("--joint-max-step-deg", type=float, default=0.5)
     capture.add_argument("--joint-controller-settle-s", type=float, default=0.25)
     capture.add_argument(
